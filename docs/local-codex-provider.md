@@ -44,6 +44,43 @@ This uses port `8900`, creates a temporary memory bank, runs:
 
 Then it deletes the temporary bank and stops the server.
 
+## Import Local memSu
+
+The local memSu importer reads `C:\Users\svmes\.memsu` in read-only mode and
+loads it through Hindsight's retain API. It does not write directly to the
+Hindsight database.
+
+Start Hindsight first:
+
+```powershell
+cd C:\Users\svmes\Documents\Playground\hindsight
+.\scripts\local\run-hindsight-codex.ps1
+```
+
+Preview the core import:
+
+```powershell
+.\scripts\local\import-memsu-to-hindsight.ps1 -SkipEvents -DryRun -BatchSize 20
+```
+
+Import core memSu state and local files into the `memsu-self` bank:
+
+```powershell
+.\scripts\local\import-memsu-to-hindsight.ps1 -SkipEvents -AsyncMode -BatchSize 20 -WaitTimeout 7200
+```
+
+Preview and import the event ledger as smaller chronological evidence batches:
+
+```powershell
+.\scripts\local\import-memsu-to-hindsight.ps1 -OnlyEvents -DryRun -EventBatchSize 25 -BatchSize 4
+.\scripts\local\import-memsu-to-hindsight.ps1 -OnlyEvents -AsyncMode -EventBatchSize 25 -BatchSize 4 -WaitTimeout 14400
+```
+
+The importer skips `backups`, `imports`, and `sync-bundle` file trees to avoid
+duplicate historical payloads. Generated retain text is passed through a small
+local redaction layer for common key/secret patterns before it is sent to
+Hindsight.
+
 ## Sync From Upstream
 
 ```powershell
