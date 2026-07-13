@@ -10,7 +10,7 @@ tests pin the new automatic-refresh behavior:
 - The OAuth refresh request shape mirrors the canonical ``@openai/codex``
   CLI (POST https://auth.openai.com/oauth/token, JSON body with hardcoded
   client_id, grant_type=refresh_token).
-- Terminal error codes (refresh_token_expired/reused/invalidated) raise a
+- Terminal error codes (invalid_grant/invalid_token and refresh_token expired/reused/invalidated) raise a
   permanent error and do not loop.
 - Concurrent callers serialize through a single-flight lock.
 - ``auth.json`` is persisted atomically via tempfile+rename with mode 0600.
@@ -24,7 +24,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
 import stat
 import sys
 import time
@@ -317,6 +316,21 @@ async def test_refresh_raises_permanent_error_on_terminal_oauth_code(tmp_path: P
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("error_code", ["invalid_grant", "invalid_token"])
+async def test_refresh_raises_permanent_error_on_terminal_400_oauth_code(tmp_path: Path, error_code: str):
+    expired = _make_jwt(int(time.time()) - 60)
+    llm = _build_llm(refresh_token="rt-stale", access_token=expired)
+    llm._auth_file = tmp_path / "auth.json"
+    llm._auth_file.write_text(json.dumps({"tokens": {"access_token": "x", "refresh_token": "rt-stale"}}))
+
+    bad_resp = _refresh_response(400, {"error": error_code})
+
+    with patch.object(llm._auth_manager._http_client, "post", return_value=bad_resp):
+        with pytest.raises(CodexRefreshExpiredError, match=error_code):
+            await llm._refresh_oauth_tokens()
+
+
+@pytest.mark.asyncio
 async def test_refresh_raises_permanent_error_on_unknown_401(tmp_path: Path):
     """Any 401 from the refresh endpoint is treated as permanent — matches upstream Rust classification."""
     expired = _make_jwt(int(time.time()) - 60)
@@ -558,8 +572,8 @@ def test_codex_oauth_embeddings_picks_up_refreshed_token_on_encode(tmp_path: Pat
     expired = _make_jwt(int(time.time()) - 60)
     new_access = _make_jwt(int(time.time()) + 3600)
 
-    _make_codex_auth_file(tmp_path, expired, refresh_token="rt-embed")
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    auth_file = _make_codex_auth_file(tmp_path, expired, refresh_token="rt-embed")
+    monkeypatch.setenv("CODEX_HOME", str(auth_file.parent))
 
     emb = CodexOAuthEmbeddings(model="text-embedding-3-small", batch_size=10)
 
@@ -589,8 +603,8 @@ def test_codex_oauth_embeddings_reactive_refresh_on_401(tmp_path: Path, monkeypa
     fresh = _make_jwt(int(time.time()) + 3600)
     new_access = _make_jwt(int(time.time()) + 7200)
 
-    _make_codex_auth_file(tmp_path, fresh, refresh_token="rt-embed")
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    auth_file = _make_codex_auth_file(tmp_path, fresh, refresh_token="rt-embed")
+    monkeypatch.setenv("CODEX_HOME", str(auth_file.parent))
 
     emb = CodexOAuthEmbeddings(model="text-embedding-3-small", batch_size=10)
     emb._dimension = 1536
