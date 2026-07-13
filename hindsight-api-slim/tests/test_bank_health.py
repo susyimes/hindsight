@@ -122,6 +122,12 @@ def test_is_auth_error_classifier():
     assert memory_engine._is_auth_error(RuntimeError("permission denied")) is True
     assert memory_engine._is_auth_error(RuntimeError("Connection refused")) is False
     assert memory_engine._is_auth_error(TimeoutError("slow")) is False
+    assert memory_engine._is_auth_error(
+        RuntimeError("Codex refresh_token is permanently invalid (error.code=refresh_token_reused).")
+    ) is True
+    assert memory_engine._is_auth_error(
+        RuntimeError("Run 'codex auth login' to re-authenticate.")
+    ) is True
 
     class _StatusErr(Exception):
         status_code = 401

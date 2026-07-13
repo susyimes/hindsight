@@ -56,7 +56,13 @@ _CODEX_TOKEN_REFRESH_SKEW_SECONDS = 60
 # itself is no longer usable. These are terminal — retrying refresh will not
 # succeed; the user must re-run ``codex auth login``.
 _CODEX_TERMINAL_REFRESH_ERROR_CODES = frozenset(
-    {"refresh_token_expired", "refresh_token_reused", "refresh_token_invalidated"}
+    {
+        "invalid_grant",
+        "invalid_token",
+        "refresh_token_expired",
+        "refresh_token_reused",
+        "refresh_token_invalidated",
+    }
 )
 
 
@@ -363,17 +369,18 @@ class CodexAuthManager:
             except httpx.RequestError as e:
                 raise RuntimeError(f"Codex OAuth refresh network error: {type(e).__name__}") from e
 
-            if response.status_code == 401:
+            if 400 <= response.status_code < 500:
                 error_code = self._extract_oauth_error_code(response)
                 if error_code in _CODEX_TERMINAL_REFRESH_ERROR_CODES:
                     raise CodexRefreshExpiredError(
                         f"Codex refresh_token is permanently invalid (error.code={error_code}). "
                         "Run 'codex auth login' to re-authenticate."
                     )
-                raise CodexRefreshExpiredError(
-                    f"Codex OAuth refresh returned 401 with unrecognized error code "
-                    f"({error_code or 'none'}). Run 'codex auth login' to re-authenticate."
-                )
+                if response.status_code == 401:
+                    raise CodexRefreshExpiredError(
+                        f"Codex OAuth refresh returned 401 with unrecognized error code "
+                        f"({error_code or 'none'}). Run 'codex auth login' to re-authenticate."
+                    )
 
             if response.status_code >= 400:
                 raise RuntimeError(f"Codex OAuth refresh failed with HTTP {response.status_code}")

@@ -201,6 +201,15 @@ _AUTH_ERROR_MARKERS = (
     "authentication",
     "permission denied",
     "permissiondenied",
+    # Codex OAuth refresh failures are terminal authentication errors. The
+    # provider raises these as typed RuntimeErrors whose messages do not always
+    # include an HTTP status, so classify the safe error code/repair wording.
+    "invalid_grant",
+    "invalid_token",
+    "refresh_token_expired",
+    "refresh_token_reused",
+    "refresh_token_invalidated",
+    "re-authenticate",
 )
 
 
