@@ -193,7 +193,7 @@ class ExtractedFact(BaseModel):
     occurred_start: str | None = Field(default=None, description="ISO timestamp for events")
     occurred_end: str | None = Field(default=None, description="ISO timestamp for event end")
     fact_type: Literal["world", "assistant"] = Field(
-        description="'world' = objective/external facts. 'assistant' = first-person actions, experiences, or observations by the speaker."
+        description="'world' = objective/external facts, including user preferences, rules, corrections, and constraints even when stated during a conversation. 'assistant' = actions, experiences, or observations the assistant/agent actually performed."
     )
     entities: list[Entity] | None = Field(default=None, description="People, places, concepts")
     causal_relations: list[FactCausalRelation] | None = Field(
@@ -230,6 +230,55 @@ class FactExtractionResponse(BaseModel):
     """Response containing all extracted facts (causal relations are embedded in each fact)."""
 
     facts: list[ExtractedFact] = Field(description="List of extracted factual statements")
+
+
+def _split_chunk_for_output_retry(chunk: str) -> tuple[str, str] | None:
+    """Split an oversized extraction chunk without corrupting structured input."""
+    stripped = chunk.strip()
+    if len(stripped) <= 1:
+        return None
+
+    try:
+        parsed = json.loads(stripped)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        parsed = None
+
+    if isinstance(parsed, list):
+        if len(parsed) >= 2:
+            mid = len(parsed) // 2
+            return json.dumps(parsed[:mid]), json.dumps(parsed[mid:])
+
+        if len(parsed) == 1 and isinstance(parsed[0], dict):
+            turn = parsed[0]
+            content = turn.get("content")
+            if isinstance(content, str) and len(content) > 1:
+                cut = len(content) // 2
+                first_turn = dict(turn)
+                second_turn = dict(turn)
+                first_turn["content"] = content[:cut]
+                second_turn["content"] = content[cut:]
+                return json.dumps([first_turn]), json.dumps([second_turn])
+
+        return None
+
+    # Split plain text at the midpoint, preferring sentence boundaries nearby.
+    mid_point = len(stripped) // 2
+    search_range = int(len(stripped) * 0.2)
+    search_start = max(0, mid_point - search_range)
+    search_end = min(len(stripped), mid_point + search_range)
+
+    best_split = mid_point
+    for ending in [". ", "! ", "? ", "\n\n"]:
+        pos = stripped.rfind(ending, search_start, search_end)
+        if pos != -1:
+            best_split = pos + len(ending)
+            break
+
+    first_half = stripped[:best_split].strip()
+    second_half = stripped[best_split:].strip()
+    if not first_half or not second_half or first_half == stripped or second_half == stripped:
+        return None
+    return first_half, second_half
 
 
 class ExtractedFactVerbose(BaseModel):
@@ -296,7 +345,7 @@ class ExtractedFactVerbose(BaseModel):
     )
 
     fact_type: Literal["world", "assistant"] = Field(
-        description="'world' = objective/external facts about other people, events, general knowledge. 'assistant' = first-person actions, experiences, or observations by the speaker (e.g., 'I changed X', 'I discovered Y')."
+        description="'world' = objective/external facts about the user, other people, events, general knowledge, preferences, rules, corrections, or constraints. 'assistant' = actions, experiences, or observations the assistant/agent actually performed (e.g., 'I changed X', 'I discovered Y')."
     )
 
     entities: list[Entity] | None = Field(
@@ -346,7 +395,7 @@ class ExtractedFactNoCausal(BaseModel):
     occurred_start: str | None = Field(default=None, description="WHEN the event happened (ISO timestamp).")
     occurred_end: str | None = Field(default=None, description="WHEN the event ended (ISO timestamp).")
     fact_type: Literal["world", "assistant"] = Field(
-        description="'world' = about the user/others. 'assistant' = experience with assistant."
+        description="'world' = about the user/others, including user preferences, rules, corrections, and constraints. 'assistant' = actions or experiences the assistant/agent actually performed."
     )
     entities: list[Entity] | None = Field(
         default=None,
@@ -663,8 +712,8 @@ fact_kind:
 - "conversation": Ongoing state, preference, trait (no dates)
 
 fact_type:
-- "world": About other people, external events, general knowledge, objective facts
-- "assistant": First-person actions, experiences, or observations by the speaker/author (e.g., "I changed X", "I discovered Y", "I debugged Z"). Also includes interactions with the user (requests, recommendations). If the narrator describes something they did, tried, learned, or decided — use "assistant".
+- "world": Objective/external facts, including the user's preferences, rules, corrections, constraints, plans, traits, or context. These stay "world" even when the user states them during an assistant interaction (e.g., "User prefers browser_navigate over web_search", "User corrected the project deadline").
+- "assistant": Actions, experiences, or observations the assistant/agent actually performed (e.g., "I changed X", "I discovered Y", "I debugged Z"). Use this for the assistant/agent doing, trying, learning, deciding, recommending, or responding — not merely for user facts mentioned in conversation.
 
 ══════════════════════════════════════════════════════════════════════════
 TEMPORAL HANDLING
@@ -766,7 +815,7 @@ RULES:
 - Extract all entities (people, places, organizations, objects, concepts).
 - Extract temporal information (occurred_start, occurred_end, fact_kind, when).
 - Extract location (where) and people (who).
-- fact_type: use "world" unless the content is clearly an interaction with the assistant."""
+- fact_type: use "world" for user preferences, rules, corrections, constraints, traits, and other objective facts, even when stated during an assistant interaction. Use "assistant" only for actions or experiences the assistant/agent actually performed."""
 
 VERBATIM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
     retain_mission_section="{retain_mission_section}",
@@ -867,8 +916,8 @@ For CONVERSATIONS (fact_kind="conversation"):
 FACT TYPE
 ══════════════════════════════════════════════════════════════════════════
 
-- **world**: User's life, other people, events (would exist without this conversation)
-- **assistant**: Interactions with assistant (requests, recommendations, help)
+- **world**: User's life, preferences, rules, corrections, constraints, other people, and events (facts that would exist without this conversation)
+- **assistant**: Actions or experiences the assistant/agent actually performed while helping the user (requests, recommendations, help)
   ⚠️ CRITICAL for assistant facts: ALWAYS capture the user's request/question in the fact!
   Include: what the user asked, what problem they wanted solved, what context they provided
 
@@ -1203,8 +1252,16 @@ def _build_request_body(llm_config, config, prompt: str, user_message: str, resp
     request_body = {
         "model": llm_config.model,
         "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
-        "temperature": 0.1,
     }
+
+    # Honour the configured retain temperature. ``None`` omits the parameter
+    # entirely (for models like Azure GPT-5.5 that reject explicit temperatures),
+    # mirroring LLMProvider.call, which drops temperature when it is None. The
+    # batch path builds the request body directly instead of going through
+    # LLMProvider.call (#2469 only de-hardcoded the streaming path), so it must
+    # apply the same rule here.
+    if config.llm_temperature_retain is not None:
+        request_body["temperature"] = config.llm_temperature_retain
 
     # Add max_completion_tokens if configured
     if config.retain_max_completion_tokens:
@@ -1226,6 +1283,15 @@ def _build_request_body(llm_config, config, prompt: str, user_message: str, resp
         }
 
     return request_body
+
+
+def _coerce_fact_response(response: Any) -> dict[str, Any] | None:
+    """Accept the schema wrapper, or a recoverable top-level facts array."""
+    if isinstance(response, dict):
+        return response
+    if isinstance(response, list) and all(isinstance(item, dict) for item in response):
+        return {"facts": response}
+    return None
 
 
 async def _extract_facts_from_chunk(
@@ -1314,7 +1380,7 @@ async def _extract_facts_from_chunk(
                 messages=[{"role": "system", "content": prompt}, {"role": "user", "content": user_message}],
                 response_format=response_schema,
                 scope="retain_extract_facts",
-                temperature=0.1,
+                temperature=config.llm_temperature_retain,
                 max_completion_tokens=config.retain_max_completion_tokens,
                 max_retries=llm_max_retries,
                 initial_backoff=initial_backoff,
@@ -1333,7 +1399,8 @@ async def _extract_facts_from_chunk(
             has_malformed_facts = False
 
             # Handle malformed LLM responses
-            if not isinstance(extraction_response_json, dict):
+            coerced_response_json = _coerce_fact_response(extraction_response_json)
+            if coerced_response_json is None:
                 if attempt < llm_max_retries - 1:
                     logger.warning(
                         f"LLM returned non-dict JSON on attempt {attempt + 1}/{llm_max_retries}: {type(extraction_response_json).__name__}. Retrying..."
@@ -1348,6 +1415,7 @@ async def _extract_facts_from_chunk(
                         f"Fact extraction failed: LLM returned non-dict JSON after {llm_max_retries} attempts "
                         f"({type(extraction_response_json).__name__}). Raw: {str(extraction_response_json)[:500]}"
                     )
+            extraction_response_json = coerced_response_json
 
             raw_facts = extraction_response_json.get("facts", [])
 
@@ -1656,33 +1724,22 @@ async def _extract_facts_with_auto_split(
             metadata=metadata,
         )
     except OutputTooLongError:
-        # Output exceeded token limits - split the chunk in half and retry
+        # Output exceeded token limits - split the chunk and retry. Conversation
+        # chunks are JSON arrays, so preserve array/turn boundaries when possible.
         logger.warning(
             f"Output too long for chunk {chunk_index + 1}/{total_chunks} "
-            f"({len(chunk)} chars). Splitting in half and retrying..."
+            f"({len(chunk)} chars). Splitting and retrying..."
         )
 
-        # Split at the midpoint, preferring sentence boundaries
-        mid_point = len(chunk) // 2
+        split_chunks = _split_chunk_for_output_retry(chunk)
+        if split_chunks is None:
+            logger.warning(
+                f"Cannot make progress splitting chunk {chunk_index + 1}/{total_chunks} "
+                f"({len(chunk)} chars); dropping this sub-chunk."
+            )
+            return [], TokenUsage()
 
-        # Try to find a sentence boundary near the midpoint
-        # Look for ". ", "! ", "? " within 20% of midpoint
-        search_range = int(len(chunk) * 0.2)
-        search_start = max(0, mid_point - search_range)
-        search_end = min(len(chunk), mid_point + search_range)
-
-        sentence_endings = [". ", "! ", "? ", "\n\n"]
-        best_split = mid_point
-
-        for ending in sentence_endings:
-            pos = chunk.rfind(ending, search_start, search_end)
-            if pos != -1:
-                best_split = pos + len(ending)
-                break
-
-        # Split the chunk
-        first_half = chunk[:best_split].strip()
-        second_half = chunk[best_split:].strip()
+        first_half, second_half = split_chunks
 
         logger.info(
             f"Split chunk {chunk_index + 1} into two sub-chunks: {len(first_half)} chars and {len(second_half)} chars"
@@ -1814,7 +1871,14 @@ async def extract_facts_from_text(
         total_usage = total_usage + chunk_usage
 
     if failed_chunks:
-        failed_summary = ", ".join(f"chunk {idx}: {type(err).__name__}" for idx, err in failed_chunks[:5])
+        # Include the exception message — not just the type — so operators
+        # can tell a structured-JSON parse failure apart from a rate limit
+        # apart from a network 5xx, all of which can surface as the same
+        # exception types. The error_message we propagate to the
+        # async_operations row is the only inspection surface a worker-side
+        # failure leaves behind, and a bare "chunk 0: RuntimeError" is not
+        # actionable.
+        failed_summary = ", ".join(f"chunk {idx}: {type(err).__name__}: {err}" for idx, err in failed_chunks[:5])
         quota_errors = [err for _, err in failed_chunks if isinstance(err, ProviderRateLimitResetError)]
         if quota_errors and len(quota_errors) == len(failed_chunks):
             retry_at = max(err.retry_at for err in quota_errors)
@@ -2120,6 +2184,19 @@ async def extract_facts_from_contents_batch_api(
             extraction_response_json = json.loads(content_str)
         except json.JSONDecodeError as e:
             message = f"{custom_id}: failed to parse JSON: {e}"
+            logger.error(message)
+            extraction_errors.add(message)
+            chunks_metadata.append(
+                ChunkMetadata(
+                    chunk_text=chunk_content, fact_count=0, content_index=content_index, chunk_index=chunk_idx
+                )
+            )
+            continue
+
+        response_type_name = type(extraction_response_json).__name__
+        extraction_response_json = _coerce_fact_response(extraction_response_json)
+        if extraction_response_json is None:
+            message = f"{custom_id}: LLM returned non-dict JSON ({response_type_name})"
             logger.error(message)
             extraction_errors.add(message)
             chunks_metadata.append(

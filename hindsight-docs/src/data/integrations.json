@@ -373,7 +373,7 @@
     {
       "id": "eve",
       "name": "Eve",
-      "description": "Long-term memory for Vercel Eve agents. A one-line MCP connection exposing retain, recall, and reflect.",
+      "description": "Automatic long-term memory for Vercel Eve agents. Memory is injected before each turn and retained after, with no model tool-calling.",
       "type": "official",
       "by": "hindsight",
       "category": "framework",
@@ -571,14 +571,24 @@
       "icon": "/img/icons/openhands.png"
     },
     {
-      "id": "windsurf",
-      "name": "Windsurf",
-      "description": "Long-term memory for Windsurf (Codeium) via its native MCP support. One command wires the Hindsight MCP server into mcp_config.json plus an always-on recall/retain rule, so memory works automatically in Cascade.",
+      "id": "devin-desktop",
+      "name": "Devin Desktop",
+      "description": "Long-term memory for Devin Desktop (the editor formerly known as Windsurf) via its native MCP support. One command wires the Hindsight MCP server into mcp_config.json plus an always-on recall/retain rule, so memory works automatically.",
       "type": "official",
       "by": "hindsight",
       "category": "tool",
-      "link": "/sdks/integrations/windsurf",
-      "icon": "/img/icons/windsurf.svg"
-    }
+      "link": "/sdks/integrations/devin-desktop",
+      "icon": "/img/icons/devin-desktop.svg"
+    },
+    {
+     "id": "epimetheus",
+     "name": "Epimetheus",
+     "description": "Memory for pi coding agent. Retain, recall, reflect, past-session ingestion, and much more, with a focus on flexibility and memory quality/best practices.",
+     "type": "community",
+     "by": "noctuid",
+     "category": "tool",
+     "link": "https://github.com/noctuid/epimetheus",
+     "icon": "/img/icons/epimetheus.png"
+   }
   ]
 }

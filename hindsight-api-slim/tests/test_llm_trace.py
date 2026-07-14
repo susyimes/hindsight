@@ -9,6 +9,7 @@ success/error paths, and the HTTP read API (list / stats / tokens).
 
 import asyncio
 import json
+import logging
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -389,6 +390,53 @@ async def test_retain_extract_success_records_usage_once(registered_recorder):
     assert r.cached_tokens == 20
 
 
+# ── real provider: litellm tool-call arg-parse failure keeps usage (#2387) ────
+
+
+def _litellm_tool_response_with_usage(arguments: str):
+    """A successful LiteLLM (OpenAI-shaped) tool-call response carrying usage,
+    like ``call_with_tools`` sees right before it ``json.loads`` the tool
+    arguments."""
+    function = SimpleNamespace(name="extract", arguments=arguments)
+    tool_call = SimpleNamespace(id="call_1", function=function)
+    message = SimpleNamespace(content=None, tool_calls=[tool_call])
+    choice = SimpleNamespace(finish_reason="tool_calls", message=message)
+    usage = SimpleNamespace(
+        prompt_tokens=140,
+        completion_tokens=18,
+        total_tokens=158,
+        prompt_tokens_details=SimpleNamespace(cached_tokens=20),
+    )
+    return SimpleNamespace(error=None, usage=usage, choices=[choice])
+
+
+@pytest.mark.asyncio
+async def test_litellm_tool_call_arg_parse_failure_keeps_usage(registered_recorder):
+    """The litellm tool path bills the provider response, then ``json.loads`` the
+    tool-call arguments locally; malformed args raise after billing, so the error
+    trace must keep the provider-reported tokens. Exercises the real
+    ``LiteLLMLLM.call_with_tools`` stash that ``LiteLLMRouterLLM`` also inherits
+    (the wrapper-level tools test uses a provider that already stashes)."""
+    llm = LLMProvider(provider="litellm", api_key="test-key", base_url="https://example.test/v1", model="gpt-4o-mini")
+    # Valid response + usage, but the tool arguments are not valid JSON.
+    llm._provider_impl._acompletion = AsyncMock(return_value=_litellm_tool_response_with_usage("{not valid json"))
+
+    with pytest.raises(json.JSONDecodeError):
+        await llm.call_with_tools(
+            messages=[{"role": "user", "content": "x"}],
+            tools=[],
+            scope="tools",
+            max_retries=0,
+        )
+
+    assert len(registered_recorder.records) == 1
+    r = registered_recorder.records[0]
+    assert r.status == "error"
+    assert r.input_tokens == 140
+    assert r.output_tokens == 18
+    assert r.cached_tokens == 20
+
+
 @pytest.mark.asyncio
 async def test_configured_provider_binds_bank_context(registered_recorder):
     llm = LLMProvider(provider="mock", api_key="", base_url="", model="mock")
@@ -752,3 +800,129 @@ async def test_real_llm_retain_and_consolidation_traced(memory_real_llm):
         assert by_op["consolidation"][0]["metadata"].get("source_memory_ids"), (
             "consolidation trace missing source_memory_ids"
         )
+
+
+# ── recorder: shutdown / pre-init race conditions ─────────────────────────────
+
+
+class _UninitializedBackend:
+    """Mimics a DB backend before initialize() or after shutdown(): the object
+    exists but the internal asyncpg pool is None, so acquiring raises."""
+
+    _pool: object | None = None
+
+    async def acquire(self):
+        raise RuntimeError("PostgreSQLBackend is not initialized. Call initialize() first.")
+
+
+class _ClosingBackend:
+    """Mimics a backend whose pool is mid-shutdown: the pool object exists but
+    asyncpg raises InterfaceError('pool is closing') on acquire."""
+
+    _pool = object()  # not None, passes the getattr guard
+
+    async def acquire(self):
+        raise Exception("pool is closing")
+
+
+class _UnexpectedErrorBackend:
+    """Mimics a backend with an unexpected (non-shutdown) error."""
+
+    _pool = object()
+
+    async def acquire(self):
+        raise RuntimeError("connection refused: some other error")
+
+
+def _make_record(scope: str = "verification") -> LLMRequestRecord:
+    return LLMRequestRecord(
+        provider="test",
+        model="test-model",
+        scope=scope,
+        status="success",
+        started_at=datetime.now(timezone.utc),
+        ended_at=datetime.now(timezone.utc),
+    )
+
+
+@pytest.mark.asyncio
+async def test_safe_write_pool_none_skips_quietly(caplog):
+    """pool_getter returning None should skip at debug, never warn."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: None,
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._safe_write(_make_record())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, f"expected no warning for pool=None, got: {[r.message for r in warnings]}"
+
+
+@pytest.mark.asyncio
+async def test_safe_write_backend_pool_none_skips_quietly(caplog):
+    """Backend exists but its internal _pool is None (post-shutdown) — should
+    skip at debug via the getattr guard, never warn."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: _UninitializedBackend(),
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._safe_write(_make_record())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, f"expected no warning for backend._pool=None, got: {[r.message for r in warnings]}"
+    assert any("not initialized" in r.message or "pool not" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_safe_write_pool_closing_downgrades_to_debug(caplog):
+    """asyncpg InterfaceError('pool is closing') during acquire should be
+    downgraded to debug, not warned."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: _ClosingBackend(),
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._safe_write(_make_record())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, f"expected no warning for pool-is-closing, got: {[r.message for r in warnings]}"
+    assert any("shutdown race" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_safe_write_unexpected_error_still_warns(caplog):
+    """Non-shutdown errors should still produce a WARNING."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: _UnexpectedErrorBackend(),
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._safe_write(_make_record())
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len(warnings) == 1, f"expected exactly 1 warning for unexpected error, got: {[r.message for r in warnings]}"
+
+
+@pytest.mark.asyncio
+async def test_attach_memory_ids_pool_none_skips_quietly(caplog):
+    """_attach_memory_ids with _pool=None should skip at debug, never warn."""
+    recorder = LLMTraceRecorder(
+        pool_getter=lambda: _UninitializedBackend(),
+        schema_getter=lambda: "public",
+        enabled=True,
+        allowed_scopes=[],
+    )
+    with caplog.at_level(logging.DEBUG, logger="hindsight_api.engine.llm_trace"):
+        await recorder._attach_memory_ids(
+            bank_id="test-bank",
+            trace_id="test-trace",
+            patch={"memory_ids": ["m1"]},
+        )
+    warnings = [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert not warnings, f"expected no warning for attach with _pool=None, got: {[r.message for r in warnings]}"

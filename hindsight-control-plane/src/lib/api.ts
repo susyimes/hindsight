@@ -357,6 +357,12 @@ export class ControlPlaneClient {
     query_timestamp?: string;
     tags?: string[];
     tags_match?: "any" | "all" | "any_strict" | "all_strict" | "exact";
+    min_scores?: {
+      semantic?: number | null;
+      keyword?: number | null;
+      reranker?: number | null;
+      final?: number | null;
+    };
   }) {
     return this.fetchApi("/api/recall", {
       method: "POST",
@@ -503,6 +509,7 @@ export class ControlPlaneClient {
         task_type: string;
         items_count: number;
         document_id: string | null;
+        filename?: string | null;
         created_at: string;
         updated_at?: string | null;
         status: string;
@@ -1198,13 +1205,25 @@ export class ControlPlaneClient {
   /**
    * List mental models for a bank
    */
-  async listMentalModels(bankId: string, tags?: string[], tagsMatch?: string) {
+  async listMentalModels(
+    bankId: string,
+    tags?: string[],
+    tagsMatch?: string,
+    limit?: number,
+    offset?: number
+  ) {
     const params = new URLSearchParams();
     if (tags && tags.length > 0) {
       tags.forEach((t) => params.append("tags", t));
     }
     if (tagsMatch) {
       params.append("tags_match", tagsMatch);
+    }
+    if (limit !== undefined) {
+      params.append("limit", String(limit));
+    }
+    if (offset !== undefined) {
+      params.append("offset", String(offset));
     }
     const query = params.toString();
     return this.fetchApi<{

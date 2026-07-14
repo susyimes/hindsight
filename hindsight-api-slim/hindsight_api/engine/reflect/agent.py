@@ -90,12 +90,87 @@ _LEAKED_JSON_SUFFIX = re.compile(
     r'\s*```(?:json)?\s*\{[^}]*(?:"(?:observation_ids|memory_ids|mental_model_ids)"|\})\s*```\s*$',
     re.DOTALL | re.IGNORECASE,
 )
-_LEAKED_JSON_OBJECT = re.compile(
-    r'\s*\{[^{]*"(?:observation_ids|memory_ids|mental_model_ids|answer)"[^}]*\}\s*$', re.DOTALL
-)
 _TRAILING_IDS_PATTERN = re.compile(
     r"\s*(?:observation_ids|memory_ids|mental_model_ids)\s*[=:]\s*\[.*?\]\s*$", re.DOTALL | re.IGNORECASE
 )
+_JSON_CODE_FENCE_PATTERN = re.compile(r"^\s*```(?:json)?\s*(\{.*\})\s*```\s*$", re.DOTALL | re.IGNORECASE)
+
+_DONE_ARGUMENT_KEYS = frozenset(
+    {
+        "answer",
+        "directive_compliance",
+        "memory_ids",
+        "mental_model_ids",
+        "observation_ids",
+        "model_ids",
+    }
+)
+_DONE_ARGUMENT_MARKER_KEYS = _DONE_ARGUMENT_KEYS - {"answer"}
+_LEAKED_JSON_ID_KEYS = frozenset({"memory_ids", "mental_model_ids", "observation_ids", "model_ids"})
+
+
+def _unwrap_leaked_done_arguments(text: str) -> str | None:
+    """Return the answer when a done tool call was rendered as JSON text.
+
+    Some providers leak the done tool's argument object instead of surfacing it
+    as a native tool call, e.g. {"answer": "...", "memory_ids": [...]}. Only
+    unwrap objects that match the done argument shape so normal JSON answers
+    stay intact.
+    """
+    candidate = text.strip()
+    if not candidate:
+        return None
+
+    fenced = _JSON_CODE_FENCE_PATTERN.match(candidate)
+    if fenced:
+        candidate = fenced.group(1).strip()
+
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(payload, dict):
+        return None
+    answer = payload.get("answer")
+    if not isinstance(answer, str) or not answer.strip():
+        return None
+
+    keys = set(payload)
+    if not keys.intersection(_DONE_ARGUMENT_MARKER_KEYS):
+        return None
+    if not keys.issubset(_DONE_ARGUMENT_KEYS):
+        return None
+
+    for key in ("memory_ids", "mental_model_ids", "observation_ids", "model_ids"):
+        value = payload.get(key)
+        if value is not None and not isinstance(value, list):
+            return None
+
+    return answer.strip()
+
+
+def _strip_trailing_id_json_object(text: str) -> str:
+    stripped = text.rstrip()
+    if not stripped.endswith("}"):
+        return text.strip()
+
+    start = stripped.rfind("{")
+    if start < 0:
+        return text.strip()
+
+    try:
+        payload = json.loads(stripped[start:])
+    except json.JSONDecodeError:
+        return text.strip()
+
+    if not isinstance(payload, dict) or not payload:
+        return text.strip()
+    keys = set(payload)
+    if not keys.issubset(_LEAKED_JSON_ID_KEYS):
+        return text.strip()
+
+    return stripped[:start].strip()
 
 
 def _clean_answer_text(text: str) -> str:
@@ -104,6 +179,10 @@ def _clean_answer_text(text: str) -> str:
     Some LLMs output the done() call as text instead of a proper tool call.
     This strips out patterns like: done({"answer": "...", ...})
     """
+    unwrapped = _unwrap_leaked_done_arguments(text)
+    if unwrapped is not None:
+        return unwrapped
+
     # Remove done() call pattern from the end of the text
     cleaned = _DONE_CALL_PATTERN.sub("", text).strip()
     return cleaned if cleaned else text
@@ -122,13 +201,17 @@ def _clean_done_answer(text: str) -> str:
     if not text:
         return text
 
+    unwrapped = _unwrap_leaked_done_arguments(text)
+    if unwrapped is not None:
+        return unwrapped
+
     cleaned = text
 
     # Remove leaked JSON in code blocks at the end
     cleaned = _LEAKED_JSON_SUFFIX.sub("", cleaned).strip()
 
     # Remove leaked raw JSON objects at the end
-    cleaned = _LEAKED_JSON_OBJECT.sub("", cleaned).strip()
+    cleaned = _strip_trailing_id_json_object(cleaned)
 
     # Remove trailing ID patterns
     cleaned = _TRAILING_IDS_PATTERN.sub("", cleaned).strip()
@@ -239,6 +322,9 @@ OUTPUT:"""
             ],
             response_format=DynamicModel,
             scope="reflect_structured",
+            max_retries=1,
+            initial_backoff=0.25,
+            max_backoff=1.0,
             skip_validation=True,  # We'll handle the dict ourselves
             return_usage=True,
         )
@@ -1300,22 +1386,35 @@ async def _execute_tool(
         query = args.get("query")
         if not query:
             return {"error": "search_mental_models requires a query parameter"}
-        max_results = int(args.get("max_results") or 5)
+        max_results, error = _parse_tool_int_arg_or_error(args, "max_results", default=5)
+        if error:
+            return {"error": error}
         return await search_mental_models_fn(query, max_results)
 
     elif tool_name == "search_observations":
         query = args.get("query")
         if not query:
             return {"error": "search_observations requires a query parameter"}
-        max_tokens = max(int(args.get("max_tokens") or 5000), 1000)  # Default 5000, min 1000
+        max_tokens, error = _parse_tool_int_arg_or_error(args, "max_tokens", default=5000, minimum=1000)
+        if error:
+            return {"error": error}
         return await search_observations_fn(query, max_tokens)
 
     elif tool_name == "recall":
         query = args.get("query")
         if not query:
             return {"error": "recall requires a query parameter"}
-        max_tokens = max(int(args.get("max_tokens") or 2048), 1000)  # Default 2048, min 1000
-        max_chunk_tokens = max(int(args.get("max_chunk_tokens") or 1000), 1000)  # Always enabled, min 1000
+        max_tokens, error = _parse_tool_int_arg_or_error(args, "max_tokens", default=2048, minimum=1000)
+        if error:
+            return {"error": error}
+        max_chunk_tokens, error = _parse_tool_int_arg_or_error(
+            args,
+            "max_chunk_tokens",
+            default=1000,
+            minimum=1000,
+        )
+        if error:
+            return {"error": error}
         return await recall_fn(query, max_tokens, max_chunk_tokens)
 
     elif tool_name == "expand":
@@ -1329,23 +1428,63 @@ async def _execute_tool(
         return {"error": f"Unknown tool: {tool_name}"}
 
 
+_NULLISH_TOOL_INT_STRINGS = {"", "none", "null"}
+
+
+def _parse_tool_int_arg(args: dict[str, Any], key: str, *, default: int, minimum: int | None = None) -> int:
+    raw_value = args.get(key)
+    if not raw_value:
+        value = default
+    elif isinstance(raw_value, str) and raw_value.strip().lower() in _NULLISH_TOOL_INT_STRINGS:
+        value = default
+    else:
+        value = int(raw_value)
+    if minimum is None:
+        return value
+    return max(value, minimum)
+
+
+def _parse_tool_int_arg_or_error(
+    args: dict[str, Any],
+    key: str,
+    *,
+    default: int,
+    minimum: int | None = None,
+) -> tuple[int, str | None]:
+    try:
+        return _parse_tool_int_arg(args, key, default=default, minimum=minimum), None
+    except (OverflowError, TypeError, ValueError):
+        return default, f"{key} must be an integer or null-like value"
+
+
+def _summarize_tool_int_arg(args: dict[str, Any], key: str, *, default: int, minimum: int | None = None) -> str:
+    try:
+        return str(_parse_tool_int_arg(args, key, default=default, minimum=minimum))
+    except (OverflowError, TypeError, ValueError):
+        return f"invalid:{args.get(key)!r}"
+
+
+def _summarize_tool_query(args: dict[str, Any]) -> str:
+    query = args.get("query") or ""
+    if not isinstance(query, str):
+        query = str(query)
+    return f"'{query[:30]}...'" if len(query) > 30 else f"'{query}'"
+
+
 def _summarize_input(tool_name: str, args: dict[str, Any]) -> str:
     """Create a summary of tool input for logging, showing all params."""
     if tool_name == "search_mental_models":
-        query = args.get("query", "")
-        query_preview = f"'{query[:30]}...'" if len(query) > 30 else f"'{query}'"
-        max_results = int(args.get("max_results") or 5)
+        query_preview = _summarize_tool_query(args)
+        max_results = _summarize_tool_int_arg(args, "max_results", default=5)
         return f"(query={query_preview}, max_results={max_results})"
     elif tool_name == "search_observations":
-        query = args.get("query", "")
-        query_preview = f"'{query[:30]}...'" if len(query) > 30 else f"'{query}'"
-        max_tokens = max(int(args.get("max_tokens") or 5000), 1000)
+        query_preview = _summarize_tool_query(args)
+        max_tokens = _summarize_tool_int_arg(args, "max_tokens", default=5000, minimum=1000)
         return f"(query={query_preview}, max_tokens={max_tokens})"
     elif tool_name == "recall":
-        query = args.get("query", "")
-        query_preview = f"'{query[:30]}...'" if len(query) > 30 else f"'{query}'"
-        max_tokens = max(int(args.get("max_tokens") or 2048), 1000)
-        max_chunk_tokens = max(int(args.get("max_chunk_tokens") or 1000), 1000)
+        query_preview = _summarize_tool_query(args)
+        max_tokens = _summarize_tool_int_arg(args, "max_tokens", default=2048, minimum=1000)
+        max_chunk_tokens = _summarize_tool_int_arg(args, "max_chunk_tokens", default=1000, minimum=1000)
         return f"(query={query_preview}, max_tokens={max_tokens}, max_chunk_tokens={max_chunk_tokens})"
     elif tool_name == "expand":
         memory_ids = args.get("memory_ids", [])
