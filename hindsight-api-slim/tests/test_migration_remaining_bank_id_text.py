@@ -26,12 +26,8 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy import create_engine, text
 
-# Both tests in this module share one module-scoped pg0 on a fixed port (5568).
-# CI runs with `--dist loadgroup`, which, absent an xdist_group, may scatter the
-# two tests across workers that then each instantiate the module fixture and race
-# to provision the SAME instance — surfacing as flaky "Instance already running",
-# a pg_type UniqueViolation (concurrent CREATE EXTENSION), or "server closed the
-# connection". Pinning the module to a single worker serialises that provisioning.
+# Both tests in this module share one module-scoped pg0. Keep them on one xdist
+# worker while the fixture uses a worker-qualified name and pg0's auto-port mode.
 pytestmark = pytest.mark.xdist_group("migration-remaining-bankid-pg0")
 
 _SCRIPT_LOCATION = str(Path(__file__).parent.parent / "hindsight_api" / "alembic")
@@ -56,19 +52,19 @@ def _col_type(conn, table: str) -> str:
 
 
 @pytest.fixture(scope="module")
-def head_db_url():
+def head_db_url(worker_id):
     """pg0 instance migrated to head (includes the widen migration)."""
     from hindsight_api.pg0 import EmbeddedPostgres
 
-    pg0 = EmbeddedPostgres(name="hindsight-remaining-bankid-test", port=5568)
+    pg0 = EmbeddedPostgres(name=f"hindsight-remaining-bankid-test-{worker_id}")
     loop = asyncio.new_event_loop()
     try:
         url = loop.run_until_complete(pg0.ensure_running())
+        command.upgrade(_alembic_cfg(url), "heads")
+        yield url
     finally:
+        loop.run_until_complete(pg0.stop())
         loop.close()
-
-    command.upgrade(_alembic_cfg(url), "heads")
-    return url
 
 
 def test_remaining_bank_id_columns_are_text(head_db_url):
