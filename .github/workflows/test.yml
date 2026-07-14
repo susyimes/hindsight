@@ -78,11 +78,33 @@ jobs:
       integrations-roo-code: ${{ steps.filter.outputs.integrations-roo-code }}
       dev: ${{ steps.filter.outputs.dev }}
       ci: ${{ steps.filter.outputs.ci }}
-      # Secrets are available for internal PRs and workflow_dispatch.
-      # Fork PRs via pull_request event do NOT have access to secrets.
-      has_secrets: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
+      has_vertexai_config: ${{ steps.provider-config.outputs.vertexai }}
+      has_slim_provider_config: ${{ steps.provider-config.outputs.slim }}
+      has_gemini_config: ${{ steps.provider-config.outputs.gemini }}
+      has_openai_config: ${{ steps.provider-config.outputs.openai }}
+      has_groq_config: ${{ steps.provider-config.outputs.groq }}
+      has_bedrock_config: ${{ steps.provider-config.outputs.bedrock }}
+      has_litellmrouter_config: ${{ steps.provider-config.outputs.litellmrouter }}
     steps:
     - uses: actions/checkout@v6
+
+    - name: Detect complete provider configuration
+      id: provider-config
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
+        COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        AWS_REGION_NAME: ${{ secrets.AWS_REGION_NAME }}
+      run: python3 scripts/ci/provider_config.py
+
+    - name: Test provider detection and mock embeddings
+      run: |
+        python3 scripts/ci/test_provider_config.py
+        python3 scripts/ci/test_mock_tei_server.py
 
     - uses: dorny/paths-filter@v4
       id: filter
@@ -1259,7 +1281,7 @@ jobs:
   test-rust-cli:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.cli == 'true' ||
@@ -1428,7 +1450,6 @@ jobs:
   build-docker-images:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.docker == 'true' ||
@@ -1498,31 +1519,50 @@ jobs:
         # causing buildx to fail with "failed to parse error response 502"
         # Build will be slower but more reliable
 
-    # Only test slim variants to save disk space (they're much smaller)
-    # Slim variants require external embedding providers
+    # Only test slim variants to save disk space (they're much smaller).
+    # Use real providers when both are complete; otherwise use mock LLM/TEI.
     - name: Setup GCP credentials for smoke test
-      if: matrix.variant == 'slim'
+      if: matrix.variant == 'slim' && needs.detect-changes.outputs.has_slim_provider_config == 'true'
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "::add-mask::$PROJECT_ID"
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
+
+    - name: Start credential-free TEI embeddings stub
+      if: matrix.variant == 'slim' && needs.detect-changes.outputs.has_slim_provider_config != 'true'
+      run: |
+        python3 scripts/ci/mock_tei_server.py --host 0.0.0.0 --port 18080 > /tmp/mock-tei.log 2>&1 &
+        for i in $(seq 1 30); do
+          if curl -sf http://localhost:18080/health > /dev/null; then
+            echo "Mock TEI server is ready after ${i}s"
+            break
+          fi
+          if [ "$i" -eq 30 ]; then
+            cat /tmp/mock-tei.log
+            exit 1
+          fi
+          sleep 1
+        done
 
     - name: Smoke test - verify container starts
       if: matrix.variant == 'slim'
       env:
-        HINDSIGHT_API_LLM_PROVIDER: vertexai
-        HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
-        HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
+        HINDSIGHT_API_LLM_PROVIDER: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && 'vertexai' || 'mock' }}
+        HINDSIGHT_API_LLM_MODEL: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && 'google/gemini-2.5-flash-lite' || 'mock' }}
+        HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && '/tmp/gcp-credentials.json' || '' }}
         HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID: ${{ env.HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID }}
-        HINDSIGHT_API_EMBEDDINGS_PROVIDER: cohere
-        HINDSIGHT_API_RERANKER_PROVIDER: cohere
+        HINDSIGHT_API_EMBEDDINGS_PROVIDER: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && 'cohere' || 'tei' }}
+        HINDSIGHT_API_EMBEDDINGS_TEI_URL: ${{ needs.detect-changes.outputs.has_slim_provider_config != 'true' && 'http://host.docker.internal:18080' || '' }}
+        HINDSIGHT_API_RERANKER_PROVIDER: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && 'cohere' || 'rrf' }}
         HINDSIGHT_API_COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
       run: ./docker/test-image.sh "hindsight-${{ matrix.name }}:test" "${{ matrix.target }}"
 
   test-api:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1538,9 +1578,11 @@ jobs:
         shard: [1, 2, 3]
     name: test-api (${{ matrix.shard }}/3)
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
-      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+      HINDSIGHT_API_LLM_PROVIDER: ${{ needs.detect-changes.outputs.has_vertexai_config == 'true' && 'vertexai' || 'mock' }}
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: ${{ needs.detect-changes.outputs.has_vertexai_config == 'true' && '/tmp/gcp-credentials.json' || '' }}
+      HINDSIGHT_API_LLM_MODEL: ${{ needs.detect-changes.outputs.has_vertexai_config == 'true' && 'google/gemini-2.5-flash-lite' || 'mock' }}
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: local
+      HINDSIGHT_API_RERANKER_PROVIDER: local
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
@@ -1557,9 +1599,13 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Setup GCP credentials
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "::add-mask::$PROJECT_ID"
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
@@ -1623,7 +1669,6 @@ jobs:
   test-api-llm-core:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
@@ -1641,28 +1686,40 @@ jobs:
       with:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
+    - name: Skip unavailable real-provider coverage
+      if: needs.detect-changes.outputs.has_vertexai_config != 'true'
+      run: echo "::notice::Core LLM tests skipped because complete Vertex AI configuration is unavailable; see the provider configuration summary."
+
     - name: Setup GCP credentials
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "::add-mask::$PROJECT_ID"
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
       uses: astral-sh/setup-uv@v7
       with:
         enable-cache: true
         prune-cache: false
 
     - name: Set up Python
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
       uses: actions/setup-python@v6
       with:
         python-version-file: ".python-version"
 
     - name: Install dependencies
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
       working-directory: ./hindsight-api-slim
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
@@ -1671,6 +1728,7 @@ jobs:
           ${{ runner.os }}-huggingface-
 
     - name: Pre-download models
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
       working-directory: ./hindsight-api-slim
       run: |
         uv run python -c "
@@ -1681,13 +1739,13 @@ jobs:
         "
 
     - name: Run core LLM tests
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
       working-directory: ./hindsight-api-slim
       run: uv run pytest tests -v -m "hs_llm_core" --timeout 600
 
   test-api-llm-acceptance:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
       ((github.event_name == 'pull_request_review' && github.event.review.state == 'approved') ||
       github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
@@ -1734,28 +1792,60 @@ jobs:
       with:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
-    - name: Setup GCP credentials
+    - name: Resolve real-provider coverage
+      id: provider
+      env:
+        VERTEXAI_CONFIGURED: ${{ needs.detect-changes.outputs.has_vertexai_config }}
+        GEMINI_CONFIGURED: ${{ needs.detect-changes.outputs.has_gemini_config }}
+        OPENAI_CONFIGURED: ${{ needs.detect-changes.outputs.has_openai_config }}
+        GROQ_CONFIGURED: ${{ needs.detect-changes.outputs.has_groq_config }}
+        BEDROCK_CONFIGURED: ${{ needs.detect-changes.outputs.has_bedrock_config }}
+        LITELLMROUTER_CONFIGURED: ${{ needs.detect-changes.outputs.has_litellmrouter_config }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        case "${{ matrix.provider }}" in
+          vertexai) configured="$VERTEXAI_CONFIGURED" ;;
+          gemini) configured="$GEMINI_CONFIGURED" ;;
+          openai) configured="$OPENAI_CONFIGURED" ;;
+          groq) configured="$GROQ_CONFIGURED" ;;
+          bedrock) configured="$BEDROCK_CONFIGURED" ;;
+          litellmrouter) configured="$LITELLMROUTER_CONFIGURED" ;;
+          *) echo "::error::Unknown provider ${{ matrix.provider }}"; exit 1 ;;
+        esac
+        echo "configured=$configured" >> "$GITHUB_OUTPUT"
+        if [ "$configured" != "true" ]; then
+          echo "::notice::Skipping ${{ matrix.provider }} real-provider coverage because its complete configuration is unavailable; see the provider configuration summary."
+        fi
+
+    - name: Setup GCP credentials
+      if: steps.provider.outputs.configured == 'true' && matrix.provider == 'vertexai'
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
+      run: |
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "::add-mask::$PROJECT_ID"
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
+      if: steps.provider.outputs.configured == 'true'
       uses: astral-sh/setup-uv@v7
       with:
         enable-cache: true
         prune-cache: false
 
     - name: Set up Python
+      if: steps.provider.outputs.configured == 'true'
       uses: actions/setup-python@v6
       with:
         python-version-file: ".python-version"
 
     - name: Install dependencies
+      if: steps.provider.outputs.configured == 'true'
       working-directory: ./hindsight-api-slim
       run: uv sync --frozen --all-extras --index-strategy unsafe-best-match
 
     - name: Cache HuggingFace models
+      if: steps.provider.outputs.configured == 'true'
       uses: actions/cache@v5
       with:
         path: ~/.cache/huggingface
@@ -1764,6 +1854,7 @@ jobs:
           ${{ runner.os }}-huggingface-
 
     - name: Pre-download models
+      if: steps.provider.outputs.configured == 'true'
       working-directory: ./hindsight-api-slim
       run: |
         uv run python -c "
@@ -1773,7 +1864,7 @@ jobs:
         "
 
     - name: Build litellmrouter config
-      if: matrix.provider == 'litellmrouter'
+      if: steps.provider.outputs.configured == 'true' && matrix.provider == 'litellmrouter'
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         ROUTER_MODEL: ${{ matrix.model }}
@@ -1786,6 +1877,7 @@ jobs:
         echo "HINDSIGHT_API_LLM_LITELLMROUTER_CONFIG=$cfg" >> "$GITHUB_ENV"
 
     - name: Run LLM acceptance tests
+      if: steps.provider.outputs.configured == 'true'
       working-directory: ./hindsight-api-slim
       run: uv run pytest tests -v -m "hs_llm_mat" --timeout 600
 
@@ -1794,7 +1886,7 @@ jobs:
     # Gated behind the "oracle-tests" PR label so it doesn't run by default.
     # Add the label to any PR that needs Oracle validation.
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       contains(github.event.pull_request.labels.*.name, 'oracle-tests') &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
@@ -1914,7 +2006,6 @@ jobs:
   test-python-client:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-python == 'true' ||
@@ -1922,9 +2013,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
-      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+      HINDSIGHT_API_LLM_PROVIDER: ${{ needs.detect-changes.outputs.has_vertexai_config == 'true' && 'vertexai' || 'mock' }}
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: ${{ needs.detect-changes.outputs.has_vertexai_config == 'true' && '/tmp/gcp-credentials.json' || '' }}
+      HINDSIGHT_API_LLM_MODEL: ${{ needs.detect-changes.outputs.has_vertexai_config == 'true' && 'google/gemini-2.5-flash-lite' || 'mock' }}
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: local
+      HINDSIGHT_API_RERANKER_PROVIDER: local
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Prefer CPU-only PyTorch in CI (but keep PyPI for everything else)
@@ -1935,9 +2028,13 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Setup GCP credentials
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "::add-mask::$PROJECT_ID"
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
@@ -1990,10 +2087,12 @@ jobs:
     - name: Create .env file
       run: |
         cat > .env << EOF
-        HINDSIGHT_API_LLM_PROVIDER=${{ env.HINDSIGHT_API_LLM_PROVIDER }}
-        HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
-        HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
-        HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_PROVIDER=$HINDSIGHT_API_LLM_PROVIDER
+        HINDSIGHT_API_LLM_MODEL=$HINDSIGHT_API_LLM_MODEL
+        HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=$HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY
+        HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=${HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID:-}
+        HINDSIGHT_API_EMBEDDINGS_PROVIDER=$HINDSIGHT_API_EMBEDDINGS_PROVIDER
+        HINDSIGHT_API_RERANKER_PROVIDER=$HINDSIGHT_API_RERANKER_PROVIDER
         EOF
 
     - name: Start API server
@@ -2026,7 +2125,6 @@ jobs:
   test-typescript-client:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
@@ -2034,9 +2132,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
-      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
+      HINDSIGHT_API_LLM_PROVIDER: ${{ needs.detect-changes.outputs.has_vertexai_config == 'true' && 'vertexai' || 'mock' }}
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: ${{ needs.detect-changes.outputs.has_vertexai_config == 'true' && '/tmp/gcp-credentials.json' || '' }}
+      HINDSIGHT_API_LLM_MODEL: ${{ needs.detect-changes.outputs.has_vertexai_config == 'true' && 'google/gemini-2.5-flash-lite' || 'mock' }}
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: local
+      HINDSIGHT_API_RERANKER_PROVIDER: local
       HINDSIGHT_API_URL: http://localhost:8888
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       # Prefer CPU-only PyTorch in CI (but keep PyPI for everything else)
@@ -2047,9 +2147,13 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Setup GCP credentials
+      if: needs.detect-changes.outputs.has_vertexai_config == 'true'
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "::add-mask::$PROJECT_ID"
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
@@ -2107,10 +2211,12 @@ jobs:
     - name: Create .env file
       run: |
         cat > .env << EOF
-        HINDSIGHT_API_LLM_PROVIDER=${{ env.HINDSIGHT_API_LLM_PROVIDER }}
-        HINDSIGHT_API_LLM_MODEL=${{ env.HINDSIGHT_API_LLM_MODEL }}
-        HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json
-        HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID
+        HINDSIGHT_API_LLM_PROVIDER=$HINDSIGHT_API_LLM_PROVIDER
+        HINDSIGHT_API_LLM_MODEL=$HINDSIGHT_API_LLM_MODEL
+        HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=$HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY
+        HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=${HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID:-}
+        HINDSIGHT_API_EMBEDDINGS_PROVIDER=$HINDSIGHT_API_EMBEDDINGS_PROVIDER
+        HINDSIGHT_API_RERANKER_PROVIDER=$HINDSIGHT_API_RERANKER_PROVIDER
         EOF
 
     - name: Start API server
@@ -2156,7 +2262,7 @@ jobs:
   test-python-client-oracle:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-python == 'true' ||
@@ -2316,7 +2422,7 @@ jobs:
   test-typescript-client-oracle:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
@@ -2476,7 +2582,7 @@ jobs:
   test-typescript-client-deno:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
@@ -2631,7 +2737,7 @@ jobs:
   test-rust-client:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-rust == 'true' ||
@@ -2747,7 +2853,7 @@ jobs:
   test-go-client:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-go == 'true' ||
@@ -2861,7 +2967,7 @@ jobs:
   test-openclaw-integration:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.integrations-openclaw == 'true' ||
@@ -2994,7 +3100,7 @@ jobs:
   test-integration:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.integration-tests == 'true' ||
@@ -3978,18 +4084,18 @@ jobs:
   test-pip-slim:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
-      HINDSIGHT_API_LLM_PROVIDER: vertexai
-      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: /tmp/gcp-credentials.json
-      HINDSIGHT_API_LLM_MODEL: google/gemini-2.5-flash-lite
-      HINDSIGHT_API_EMBEDDINGS_PROVIDER: cohere
-      HINDSIGHT_API_RERANKER_PROVIDER: cohere
+      HINDSIGHT_API_LLM_PROVIDER: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && 'vertexai' || 'mock' }}
+      HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && '/tmp/gcp-credentials.json' || '' }}
+      HINDSIGHT_API_LLM_MODEL: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && 'google/gemini-2.5-flash-lite' || 'mock' }}
+      HINDSIGHT_API_EMBEDDINGS_PROVIDER: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && 'cohere' || 'tei' }}
+      HINDSIGHT_API_EMBEDDINGS_TEI_URL: ${{ needs.detect-changes.outputs.has_slim_provider_config != 'true' && 'http://localhost:18080' || '' }}
+      HINDSIGHT_API_RERANKER_PROVIDER: ${{ needs.detect-changes.outputs.has_slim_provider_config == 'true' && 'cohere' || 'rrf' }}
       HINDSIGHT_API_COHERE_API_KEY: ${{ secrets.COHERE_API_KEY }}
 
     steps:
@@ -3998,9 +4104,13 @@ jobs:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
     - name: Setup GCP credentials
+      if: needs.detect-changes.outputs.has_slim_provider_config == 'true'
+      env:
+        GCP_VERTEXAI_CREDENTIALS: ${{ secrets.GCP_VERTEXAI_CREDENTIALS }}
       run: |
-        printf '%s' '${{ secrets.GCP_VERTEXAI_CREDENTIALS }}' > /tmp/gcp-credentials.json
+        printf '%s' "$GCP_VERTEXAI_CREDENTIALS" > /tmp/gcp-credentials.json
         PROJECT_ID=$(jq -r '.project_id' /tmp/gcp-credentials.json)
+        echo "::add-mask::$PROJECT_ID"
         echo "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=$PROJECT_ID" >> $GITHUB_ENV
 
     - name: Install uv
@@ -4017,6 +4127,22 @@ jobs:
     - name: Install hindsight-api-slim (embedded-db only, no local ML)
       working-directory: ./hindsight-api-slim
       run: uv sync --frozen --extra embedded-db --index-strategy unsafe-best-match
+
+    - name: Start credential-free TEI embeddings stub
+      if: needs.detect-changes.outputs.has_slim_provider_config != 'true'
+      run: |
+        python3 scripts/ci/mock_tei_server.py --port 18080 > /tmp/mock-tei.log 2>&1 &
+        for i in $(seq 1 30); do
+          if curl -sf http://localhost:18080/health > /dev/null; then
+            echo "Mock TEI server is ready after ${i}s"
+            break
+          fi
+          if [ "$i" -eq 30 ]; then
+            cat /tmp/mock-tei.log
+            exit 1
+          fi
+          sleep 1
+        done
 
     - name: Start API server
       working-directory: ./hindsight-api-slim
@@ -4043,6 +4169,10 @@ jobs:
       run: |
         echo "=== API Server Logs ==="
         cat /tmp/slim-api-server.log 2>/dev/null || true
+        if [ -f /tmp/mock-tei.log ]; then
+          echo "=== Mock TEI Logs ==="
+          cat /tmp/mock-tei.log
+        fi
 
   verify-embed-control-center-bundle:
     # The control center UI (Preact + Tailwind) is built with Vite and its static
@@ -4090,7 +4220,7 @@ jobs:
   test-embed:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.embed == 'true' ||
@@ -4158,7 +4288,7 @@ jobs:
     # (closes #1240).
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.embed == 'true' ||
@@ -4337,7 +4467,7 @@ jobs:
   test-hindsight-all:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.hindsight-all == 'true' ||
@@ -4428,7 +4558,7 @@ jobs:
   test-doc-examples:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.clients-ts == 'true' ||
@@ -4581,7 +4711,7 @@ jobs:
   test-upgrade:
     needs: [detect-changes]
     if: >-
-      needs.detect-changes.outputs.has_secrets == 'true' &&
+      needs.detect-changes.outputs.has_vertexai_config == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
       needs.detect-changes.outputs.core == 'true' ||
       needs.detect-changes.outputs.dev == 'true' ||

@@ -13,12 +13,14 @@
 #   target  - Optional: 'cp-only' for control plane, otherwise assumes API image (default: api)
 #
 # Environment variables:
-#   HINDSIGHT_API_LLM_API_KEY                   - Required for API/standalone images (LLM verification)
+#   HINDSIGHT_API_LLM_API_KEY                   - Required for remote API-key LLM providers
 #   HINDSIGHT_API_LLM_PROVIDER                  - LLM provider (default: openai)
 #   HINDSIGHT_API_LLM_MODEL                     - LLM model (default: gpt-4o-mini)
 #   HINDSIGHT_API_EMBEDDINGS_PROVIDER           - Embeddings provider (optional, for slim images: openai, cohere, tei)
 #   HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY     - OpenAI API key for embeddings (optional)
+#   HINDSIGHT_API_EMBEDDINGS_TEI_URL             - TEI embeddings endpoint (optional)
 #   HINDSIGHT_API_RERANKER_PROVIDER             - Reranker provider (optional, for slim images: cohere, tei)
+#   HINDSIGHT_API_RERANKER_TEI_URL               - TEI reranker endpoint (optional)
 #   HINDSIGHT_API_COHERE_API_KEY                - Cohere API key for reranking (optional)
 #   SMOKE_TEST_TIMEOUT                          - Timeout in seconds (default: 120)
 #   SMOKE_TEST_CONTAINER_NAME                   - Container name (default: hindsight-smoke-test)
@@ -91,7 +93,11 @@ else
 fi
 
 # Check for required environment variables
-if [ "$NEEDS_LLM" = true ] && [ "$LLM_PROVIDER" != "vertexai" ] && [ -z "${HINDSIGHT_API_LLM_API_KEY:-}" ]; then
+if [ "$NEEDS_LLM" = true ] \
+    && [ "$LLM_PROVIDER" != "vertexai" ] \
+    && [ "$LLM_PROVIDER" != "mock" ] \
+    && [ "$LLM_PROVIDER" != "none" ] \
+    && [ -z "${HINDSIGHT_API_LLM_API_KEY:-}" ]; then
     echo -e "${RED}Error: HINDSIGHT_API_LLM_API_KEY environment variable is required for API/standalone images${NC}"
     echo "Set it with: export HINDSIGHT_API_LLM_API_KEY=your-api-key"
     exit 2
@@ -124,47 +130,54 @@ if [ "$TARGET" = "cp-only" ]; then
         "$IMAGE"
 else
     # Build docker run command with required and optional env vars
-    DOCKER_CMD="docker run -d --name $CONTAINER_NAME"
-    DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_LLM_PROVIDER=$LLM_PROVIDER"
+    DOCKER_CMD=(docker run -d --name "$CONTAINER_NAME")
+    DOCKER_CMD+=(-e "HINDSIGHT_API_LLM_PROVIDER=$LLM_PROVIDER")
     if [ -n "${HINDSIGHT_API_LLM_API_KEY:-}" ]; then
-        DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_LLM_API_KEY=${HINDSIGHT_API_LLM_API_KEY}"
+        DOCKER_CMD+=(-e "HINDSIGHT_API_LLM_API_KEY=${HINDSIGHT_API_LLM_API_KEY}")
     fi
-    DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_LLM_MODEL=$LLM_MODEL"
+    DOCKER_CMD+=(-e "HINDSIGHT_API_LLM_MODEL=$LLM_MODEL")
 
     # Add Vertex AI config if provider is vertexai
     if [ "$LLM_PROVIDER" = "vertexai" ]; then
         if [ -n "${HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY:-}" ]; then
-            DOCKER_CMD="$DOCKER_CMD -v ${HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY}:/tmp/gcp-credentials.json:ro"
-            DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json"
+            DOCKER_CMD+=(-v "${HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY}:/tmp/gcp-credentials.json:ro")
+            DOCKER_CMD+=(-e "HINDSIGHT_API_LLM_VERTEXAI_SERVICE_ACCOUNT_KEY=/tmp/gcp-credentials.json")
         fi
         if [ -n "${HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID:-}" ]; then
-            DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=${HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID}"
+            DOCKER_CMD+=(-e "HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID=${HINDSIGHT_API_LLM_VERTEXAI_PROJECT_ID}")
         fi
         if [ -n "${HINDSIGHT_API_LLM_VERTEXAI_REGION:-}" ]; then
-            DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_LLM_VERTEXAI_REGION=${HINDSIGHT_API_LLM_VERTEXAI_REGION}"
+            DOCKER_CMD+=(-e "HINDSIGHT_API_LLM_VERTEXAI_REGION=${HINDSIGHT_API_LLM_VERTEXAI_REGION}")
         fi
     fi
 
     # Add optional embeddings provider config
     if [ -n "${HINDSIGHT_API_EMBEDDINGS_PROVIDER:-}" ]; then
-        DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_EMBEDDINGS_PROVIDER=${HINDSIGHT_API_EMBEDDINGS_PROVIDER}"
+        DOCKER_CMD+=(-e "HINDSIGHT_API_EMBEDDINGS_PROVIDER=${HINDSIGHT_API_EMBEDDINGS_PROVIDER}")
     fi
     if [ -n "${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY:-}" ]; then
-        DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY}"
+        DOCKER_CMD+=(-e "HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY=${HINDSIGHT_API_EMBEDDINGS_OPENAI_API_KEY}")
+    fi
+    if [ -n "${HINDSIGHT_API_EMBEDDINGS_TEI_URL:-}" ]; then
+        DOCKER_CMD+=(-e "HINDSIGHT_API_EMBEDDINGS_TEI_URL=${HINDSIGHT_API_EMBEDDINGS_TEI_URL}")
+        DOCKER_CMD+=(--add-host "host.docker.internal:host-gateway")
     fi
 
     # Add optional reranker provider config
     if [ -n "${HINDSIGHT_API_RERANKER_PROVIDER:-}" ]; then
-        DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_RERANKER_PROVIDER=${HINDSIGHT_API_RERANKER_PROVIDER}"
+        DOCKER_CMD+=(-e "HINDSIGHT_API_RERANKER_PROVIDER=${HINDSIGHT_API_RERANKER_PROVIDER}")
+    fi
+    if [ -n "${HINDSIGHT_API_RERANKER_TEI_URL:-}" ]; then
+        DOCKER_CMD+=(-e "HINDSIGHT_API_RERANKER_TEI_URL=${HINDSIGHT_API_RERANKER_TEI_URL}")
     fi
     if [ -n "${HINDSIGHT_API_COHERE_API_KEY:-}" ]; then
-        DOCKER_CMD="$DOCKER_CMD -e HINDSIGHT_API_COHERE_API_KEY=${HINDSIGHT_API_COHERE_API_KEY}"
+        DOCKER_CMD+=(-e "HINDSIGHT_API_COHERE_API_KEY=${HINDSIGHT_API_COHERE_API_KEY}")
     fi
 
-    DOCKER_CMD="$DOCKER_CMD -p ${HEALTH_PORT}:${HEALTH_PORT}"
-    DOCKER_CMD="$DOCKER_CMD $IMAGE"
+    DOCKER_CMD+=(-p "${HEALTH_PORT}:${HEALTH_PORT}")
+    DOCKER_CMD+=("$IMAGE")
 
-    eval $DOCKER_CMD
+    "${DOCKER_CMD[@]}"
 fi
 
 # Wait for health endpoint

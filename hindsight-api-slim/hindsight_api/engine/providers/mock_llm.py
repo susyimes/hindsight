@@ -175,13 +175,7 @@ class MockLLM(LLMInterface):
             # Reflect: return a plausible text answer
             result = "Based on the available information, the answer is related to the context provided."
         elif response_format is not None:
-            # Structured output: try to return a valid empty instance of the model
-            # so that callers expecting e.g. response_format with defaults
-            # get a valid instance rather than a crash on {"mock": True}.
-            try:
-                result = response_format()
-            except Exception:
-                result = {"mock": True}
+            result = self._build_mock_structured_response(response_format)
         else:
             result = "mock response"
 
@@ -189,6 +183,45 @@ class MockLLM(LLMInterface):
             token_usage = TokenUsage(input_tokens=10, output_tokens=5, total_tokens=15)
             return result, token_usage
         return result
+
+    @staticmethod
+    def _build_mock_structured_response(response_format: Any) -> Any:
+        """Populate required primitive fields when empty construction fails.
+
+        Reflect builds a Pydantic model from the caller's JSON Schema, so the old
+        ``{"mock": True}`` fallback violated that model whenever fields were required.
+        """
+        try:
+            return response_format()
+        except Exception:
+            pass
+
+        if not hasattr(response_format, "model_json_schema"):
+            return {"mock": True}
+
+        schema = response_format.model_json_schema()
+        properties = schema.get("properties", {})
+        payload: dict[str, Any] = {}
+        for field_name in schema.get("required", []):
+            field_type = properties.get(field_name, {}).get("type")
+            if field_type == "array":
+                value: Any = ["mock"]
+            elif field_type == "object":
+                value = {}
+            elif field_type == "integer":
+                value = 0
+            elif field_type == "number":
+                value = 0.0
+            elif field_type == "boolean":
+                value = True
+            else:
+                value = "mock"
+            payload[field_name] = value
+
+        try:
+            return response_format.model_validate(payload)
+        except Exception:
+            return payload or {"mock": True}
 
     async def call_with_tools(
         self,

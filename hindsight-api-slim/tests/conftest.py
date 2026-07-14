@@ -63,13 +63,18 @@ def _cleanup_leaked_span_recorders():
     ``_teardown_memory_engine``/``close()``) leak an *enabled* recorder; a later
     test's LLM calls then get recorded into the shared DB, flaking
     ``test_llm_trace::test_disabled_writes_no_rows`` (it observes rows for its
-    bank even though its own recorder is disabled). ``_teardown_memory_engine``
-    guards the fixtures; this guards everything else by dropping any recorder a
-    test added to the registry.
+    bank even though its own recorder is disabled). A recorder that is already
+    present when this fixture starts must not be included in the snapshot: that
+    would preserve it for the next test under xdist. Drop stale DB recorders at
+    setup, then drop anything the current test adds at teardown.
     """
+    from hindsight_api.engine.llm_trace import LLMTraceRecorder
     from hindsight_api.tracing import get_span_recorder
 
     recorders = get_span_recorder()._recorders
+    for recorder in list(recorders):
+        if isinstance(recorder, LLMTraceRecorder):
+            recorders.remove(recorder)
     before = {id(r) for r in recorders}
     yield
     for recorder in list(recorders):

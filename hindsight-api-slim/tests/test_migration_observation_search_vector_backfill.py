@@ -39,23 +39,23 @@ def _alembic_cfg(db_url: str) -> Config:
 
 
 @pytest.fixture(scope="module")
-def pre_backfill_db_url():
+def pre_backfill_db_url(worker_id):
     """pg0 instance brought to the revision just before the backfill so the
     migration's UPDATE runs against seeded NULL-search_vector observations."""
     from hindsight_api.pg0 import EmbeddedPostgres
 
-    pg0 = EmbeddedPostgres(name="hindsight-obs-sv-backfill-test", port=5568)
+    pg0 = EmbeddedPostgres(name=f"hindsight-obs-sv-backfill-test-{worker_id}")
     loop = asyncio.new_event_loop()
     try:
         url = loop.run_until_complete(pg0.ensure_running())
+        # pg0 data dirs persist across runs, so normalise: go to head, then down
+        # to just before the backfill.
+        command.upgrade(_alembic_cfg(url), "heads")
+        command.downgrade(_alembic_cfg(url), _PRE_BACKFILL_REVISION)
+        yield url
     finally:
+        loop.run_until_complete(pg0.stop())
         loop.close()
-
-    # pg0 data dirs persist across runs, so normalise: go to head, then down to
-    # just before the backfill.
-    command.upgrade(_alembic_cfg(url), "heads")
-    command.downgrade(_alembic_cfg(url), _PRE_BACKFILL_REVISION)
-    return url
 
 
 def test_backfill_populates_null_observation_search_vector(pre_backfill_db_url):
