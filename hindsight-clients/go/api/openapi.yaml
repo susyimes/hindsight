@@ -7,7 +7,7 @@ info:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0.html
   title: Hindsight HTTP API
-  version: 0.8.3
+  version: 0.8.4
 servers:
 - url: /
 paths:
@@ -583,6 +583,19 @@ paths:
           title: Bank Id
           type: string
         style: simple
+      - description: "Force a fresh recompute, bypassing the cached value (and refreshing\
+          \ the cache)."
+        explode: true
+        in: query
+        name: refresh
+        required: false
+        schema:
+          default: false
+          description: "Force a fresh recompute, bypassing the cached value (and refreshing\
+            \ the cache)."
+          title: Refresh
+          type: boolean
+        style: form
       - explode: false
         in: header
         name: authorization
@@ -6326,6 +6339,9 @@ components:
           date: 2024-01-15T10:30:00Z
           entities: "Alice (PERSON), Google (ORGANIZATION)"
           id: 550e8400-e29b-41d4-a716-446655440000
+          metadata:
+            channel: engineering
+            source: slack
           text: Alice works at Google on the AI team
           type: world
         limit: 100
@@ -6888,6 +6904,30 @@ components:
           nullable: true
           type: integer
       title: MentalModelTrigger
+    MinScores:
+      description: |-
+        Optional per-stage score floors for recall (all inclusive, AND-ed).
+
+        ``semantic`` and ``keyword`` are **retrieval-level** cutoffs pushed into the SQL
+        arms (overriding the global ``semantic_min_similarity`` / ``bm25_min_score``
+        config for this request), so they prune weak matches before fusion. ``reranker``
+        and ``final`` are **post-query** filters applied to the scored results after
+        reranking. Any field left None imposes no floor; all-None (the default) means
+        no score filtering.
+      properties:
+        semantic:
+          nullable: true
+          type: number
+        keyword:
+          nullable: true
+          type: number
+        reranker:
+          nullable: true
+          type: number
+        final:
+          nullable: true
+          type: number
+      title: MinScores
     ObservationScope:
       description: "A distinct observation scope: an exact tag set plus its observation\
         \ count."
@@ -6980,6 +7020,9 @@ components:
           title: Items Count
           type: integer
         document_id:
+          nullable: true
+          type: string
+        filename:
           nullable: true
           type: string
         created_at:
@@ -7184,6 +7227,8 @@ components:
             $ref: '#/components/schemas/MentalModelTrigger_Input_tag_groups_inner'
           nullable: true
           type: array
+        min_scores:
+          $ref: '#/components/schemas/MinScores'
       required:
       - query
       title: RecallRequest
@@ -7307,10 +7352,39 @@ components:
             type: string
           nullable: true
           type: array
+        scores:
+          $ref: '#/components/schemas/RecallScores'
       required:
       - id
       - text
       title: RecallResult
+    RecallScores:
+      description: |-
+        Per-result recall scores from different stages of the pipeline.
+
+        ``final`` is the value results are ranked by. The others are diagnostic and
+        can be filtered on via the recall ``min_scores`` request parameter. ``semantic``
+        and ``keyword`` are the raw per-strategy retrieval scores (``None`` when that
+        strategy did not surface this result); ``reranker`` is the cross-encoder's
+        normalized relevance.
+      properties:
+        final:
+          description: Final ranking score (combined reranker + recency/temporal/proof
+            boosts)
+          title: Final
+          type: number
+        reranker:
+          nullable: true
+          type: number
+        semantic:
+          nullable: true
+          type: number
+        keyword:
+          nullable: true
+          type: number
+      required:
+      - final
+      title: RecallScores
     RecoverConsolidationResponse:
       description: Response model for recovering failed consolidation.
       example:

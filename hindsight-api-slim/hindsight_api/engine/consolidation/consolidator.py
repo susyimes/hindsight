@@ -28,6 +28,7 @@ from fnmatch import fnmatchcase
 from itertools import combinations
 from typing import TYPE_CHECKING, Any, Literal
 
+import asyncpg
 from pydantic import BaseModel, field_validator
 
 from ...config import get_config
@@ -98,9 +99,32 @@ _DEDUP_TOP_K = 5
 class _DedupDecision(BaseModel):
     """Focused 1-by-1 verdict for whether a new observation duplicates an existing one."""
 
-    action: Literal["merge", "keep"]
+    action: Literal["merge", "keep"] = "keep"
     text: str = ""  # the synthesized merged observation (when action == "merge")
     reason: str = ""
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _normalize_action(cls, value: object) -> str:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"merge", "keep"}:
+                return normalized
+
+        logger.warning("Invalid consolidation dedup action %r; defaulting to keep", value)
+        return "keep"
+
+
+def _dedup_decision_from_response(raw: Any) -> _DedupDecision:
+    try:
+        if isinstance(raw, _DedupDecision):
+            return raw
+        if isinstance(raw, str):
+            return _DedupDecision.model_validate_json(raw)
+        return _DedupDecision.model_validate(raw)
+    except ValueError as exc:
+        logger.warning("Invalid consolidation dedup response %r; defaulting to keep: %s", raw, exc)
+        return _DedupDecision(action="keep", reason="invalid structured response")
 
 
 _DEDUP_PROMPT = """You reconcile long-term memory observations. A NEW observation is about to be \
@@ -109,9 +133,20 @@ stored, and it is highly similar to an EXISTING one:
 [NEW] {new}
 [EXISTING] {existing}
 
-If they assert the SAME fact (wording aside), respond action="merge" and provide `text`: a single \
-observation that preserves EVERY detail from both. If they differ in ANY important detail — a \
-number/quantity, a named entity or language, a negation, or a condition — respond action="keep"."""
+Respond with ONLY one valid JSON object matching one of these shapes:
+
+For duplicate facts:
+{{"action": "merge", "text": "...", "reason": "..."}}
+
+For distinct facts:
+{{"action": "keep", "text": "", "reason": "..."}}
+
+Do NOT use key=value lines, markdown fences, or any text outside the JSON object.
+
+If they assert the SAME fact (wording aside), set "action" to "merge" and provide "text": a \
+single observation that preserves EVERY detail from both. If they differ in ANY important detail \
+— a number/quantity, a named entity or language, a negation, or a condition — set "action" to \
+"keep" and "text" to an empty string."""
 
 
 def _dedup_active(config: Any) -> bool:
@@ -189,10 +224,12 @@ async def _dedup_adjudicate(
     if best_id is None:
         return _DedupOutcome(best_id=None, merged_text="", should_merge=False)
 
-    decision: _DedupDecision = await dedup_llm_config.call(
-        messages=[{"role": "user", "content": _DEDUP_PROMPT.format(new=anchor_text, existing=best_text)}],
-        response_format=_DedupDecision,
-        scope="consolidation_dedup",
+    decision = _dedup_decision_from_response(
+        await dedup_llm_config.call(
+            messages=[{"role": "user", "content": _DEDUP_PROMPT.format(new=anchor_text, existing=best_text)}],
+            response_format=_DedupDecision,
+            scope="consolidation_dedup",
+        )
     )
     if decision.action != "merge":
         return _DedupOutcome(best_id=best_id, merged_text="", should_merge=False)
@@ -224,13 +261,18 @@ async def _dedup_reconcile_create(
     # Fold the new source facts into the twin and persist the merged text. We keep the twin's
     # existing embedding: the merged text is >= threshold similar, so the stored vector stays
     # representative and we avoid a re-embed + a dialect-specific vector UPDATE.
+    search_vector_clause = (
+        f",\n            search_vector = to_tsvector('{config.text_search_extension_native_language}'::regconfig, COALESCE($1, ''))"
+        if config.text_search_extension == "native"
+        else ""
+    )
     await conn.execute(
         f"""
         UPDATE {fq_table("memory_units")}
         SET text = $1,
             source_memory_ids = (SELECT array_agg(DISTINCT e) FROM unnest(source_memory_ids || $2::uuid[]) e),
             proof_count = (SELECT count(DISTINCT e) FROM unnest(source_memory_ids || $2::uuid[]) e),
-            updated_at = now()
+            updated_at = now(){search_vector_clause}
         WHERE id = $3::uuid
         """,
         outcome.merged_text,
@@ -279,6 +321,11 @@ async def _dedup_reconcile_update(
     # the create path) then delete the now-redundant updated row. The all_strict/any tag match
     # guarantees twin and updated share scope, so dropping the updated row's tags loses no
     # visibility. Temporal fields follow the surviving twin (minimal scope; matches create).
+    search_vector_clause = (
+        f",\n            search_vector = to_tsvector('{config.text_search_extension_native_language}'::regconfig, COALESCE($1, ''))"
+        if config.text_search_extension == "native"
+        else ""
+    )
     await conn.execute(
         f"""
         UPDATE {fq_table("memory_units")} t
@@ -289,7 +336,7 @@ async def _dedup_reconcile_update(
             proof_count = (
                 SELECT count(DISTINCT e) FROM unnest(t.source_memory_ids || u.source_memory_ids) e
             ),
-            updated_at = now()
+            updated_at = now(){search_vector_clause}
         FROM {fq_table("memory_units")} u
         WHERE t.id = $2::uuid AND u.id = $3::uuid
         """,
@@ -1756,15 +1803,22 @@ async def _append_observation_history(
     history from growing without bound.
     """
     obs_uuid = uuid.UUID(observation_id)
-    await conn.execute(
-        f"""
+    try:
+        await conn.execute(
+            f"""
         INSERT INTO {fq_table("observation_history")} (observation_id, bank_id, content, changed_at)
         VALUES ($1, $2, $3::jsonb, now())
         """,
-        obs_uuid,
-        bank_id,
-        json.dumps(asdict(snapshot)),
-    )
+            obs_uuid,
+            bank_id,
+            json.dumps(asdict(snapshot)),
+        )
+    except asyncpg.exceptions.ForeignKeyViolationError:
+        logger.warning(
+            f"FK violation writing observation_history for {observation_id}: "
+            "observation was removed before history could be written (race with parallel consolidation). Skipping."
+        )
+        return
     if max_entries and max_entries > 0:
         await conn.execute(
             f"""
@@ -1845,6 +1899,12 @@ async def _execute_update_action(
 
     config = get_config()
 
+    search_vector_clause = (
+        f",\n            search_vector = to_tsvector('{config.text_search_extension_native_language}'::regconfig, COALESCE($1, ''))"
+        if config.text_search_extension == "native"
+        else ""
+    )
+
     t0 = time.time()
     await conn.execute(
         f"""
@@ -1857,7 +1917,7 @@ async def _execute_update_action(
             updated_at = now(),
             occurred_start = LEAST(occurred_start, COALESCE($6, occurred_start)),
             occurred_end = GREATEST(occurred_end, COALESCE($7, occurred_end)),
-            mentioned_at = GREATEST(mentioned_at, COALESCE($8, mentioned_at))
+            mentioned_at = GREATEST(mentioned_at, COALESCE($8, mentioned_at)){search_vector_clause}
         WHERE id = $5
         """,
         new_text,
@@ -2333,16 +2393,20 @@ async def _create_observation_directly(
                     tokenize($3, 'llmlingua2')::bm25_catalog.bm25vector)
             RETURNING id
         """
-    else:  # native, pg_textsearch, pgroonga, or pg_search
-        # pg_textsearch / pgroonga / pg_search: indexes operate on base text
-        # columns directly, so the dummy search_vector column is left NULL.
-        # Native: the migration p4q5r6s7t8u9 dropped the GENERATED expression on
-        # search_vector to allow per-deployment language configuration; the
-        # batch insert path in ops_postgresql.insert_facts_batch now populates
-        # it via to_tsvector($lang, ...). This single-observation INSERT does
-        # not, so observations under the native backend currently land with
-        # NULL search_vector and are not BM25-searchable until reflected/
-        # re-ingested. Tracking a separate fix for that gap.
+    elif config.text_search_extension == "native":
+        # Native: search_vector is populated with to_tsvector() using the
+        # configured native language dictionary, matching the batch insert
+        # path in ops_postgresql.insert_facts_batch.
+        query = f"""
+            INSERT INTO {fq_table("memory_units")} (
+                id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,
+                tags, event_date, occurred_start, occurred_end, mentioned_at, search_vector
+            )
+            VALUES ($1, $2, $3, 'observation', $4::vector, 1, $5, $6, $7, $8, $9, $10,
+                    to_tsvector('{config.text_search_extension_native_language}'::regconfig, COALESCE($3, '')))
+            RETURNING id
+        """
+    else:  # pg_textsearch, pgroonga, pg_search: indexes operate on base text columns directly
         query = f"""
             INSERT INTO {fq_table("memory_units")} (
                 id, bank_id, text, fact_type, embedding, proof_count, source_memory_ids,

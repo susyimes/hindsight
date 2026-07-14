@@ -61,7 +61,7 @@ jobs:
       integrations-lockfiles: ${{ steps.filter.outputs.integrations-lockfiles }}
       integrations-openai-agents: ${{ steps.filter.outputs.integrations-openai-agents }}
       integrations-openhands: ${{ steps.filter.outputs.integrations-openhands }}
-      integrations-windsurf: ${{ steps.filter.outputs.integrations-windsurf }}
+      integrations-devin-desktop: ${{ steps.filter.outputs.integrations-devin-desktop }}
       integrations-pipecat: ${{ steps.filter.outputs.integrations-pipecat }}
       integrations-agentcore: ${{ steps.filter.outputs.integrations-agentcore }}
       integrations-smolagents: ${{ steps.filter.outputs.integrations-smolagents }}
@@ -196,8 +196,8 @@ jobs:
             - 'hindsight-integrations/openai-agents/**'
           integrations-openhands:
             - 'hindsight-integrations/openhands/**'
-          integrations-windsurf:
-            - 'hindsight-integrations/windsurf/**'
+          integrations-devin-desktop:
+            - 'hindsight-integrations/devin-desktop/**'
           integrations-pipecat:
             - 'hindsight-integrations/pipecat/**'
           integrations-agentcore:
@@ -520,22 +520,17 @@ jobs:
       with:
         ref: ${{ github.event.pull_request.head.sha || '' }}
 
-    - name: Set up Python
-      uses: actions/setup-python@v6
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
       with:
-        python-version: '3.11'
-
-    - name: Install package and pytest
-      working-directory: ./hindsight-integrations/zed
-      # Installs the package (incl. the zstandard runtime dep) so the threads.db
-      # reader tests can decompress Zed's zstd blobs.
-      run: pip install -e . pytest
+        node-version: '22'
 
     - name: Run tests
       working-directory: ./hindsight-integrations/zed
-      # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
-      # (requires_real_llm) needs a live Hindsight server and runs separately.
-      run: python -m pytest tests/ -v -m "not requires_real_llm"
+      # Config-only integration with no dependencies — it uses Node's built-in
+      # test runner. The runtime MCP bridge is `npx mcp-remote` (Node), so this
+      # integration requires only Node.js (no Python).
+      run: npm test
 
   test-omo-integration:
     needs: [detect-changes]
@@ -3866,11 +3861,11 @@ jobs:
       # (requires_real_llm) needs a live Hindsight server and runs separately.
       run: uv run pytest tests -v -m "not requires_real_llm"
 
-  test-windsurf-integration:
+  test-devin-desktop-integration:
     needs: [detect-changes]
     if: >-
       (github.event_name == 'workflow_dispatch' ||
-      needs.detect-changes.outputs.integrations-windsurf == 'true' ||
+      needs.detect-changes.outputs.integrations-devin-desktop == 'true' ||
       needs.detect-changes.outputs.ci == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -3891,16 +3886,16 @@ jobs:
       with:
         python-version-file: ".python-version"
 
-    - name: Build windsurf integration
-      working-directory: ./hindsight-integrations/windsurf
+    - name: Build devin-desktop integration
+      working-directory: ./hindsight-integrations/devin-desktop
       run: uv build
 
     - name: Install dependencies
-      working-directory: ./hindsight-integrations/windsurf
+      working-directory: ./hindsight-integrations/devin-desktop
       run: uv sync --frozen
 
     - name: Run tests
-      working-directory: ./hindsight-integrations/windsurf
+      working-directory: ./hindsight-integrations/devin-desktop
       # PR CI runs only the deterministic bucket; the real-LLM E2E bucket
       # (requires_real_llm) needs a live Hindsight server and runs separately.
       run: uv run pytest tests -v -m "not requires_real_llm"
@@ -4957,7 +4952,7 @@ jobs:
       - test-llamaindex-integration
       - test-openai-agents-integration
       - test-openhands-integration
-      - test-windsurf-integration
+      - test-devin-desktop-integration
       - test-agentcore-integration
       - test-haystack-integration
       - test-pip-slim

@@ -47,6 +47,19 @@ logger = logging.getLogger(__name__)
 # Seed applied to every Groq request for deterministic behavior
 DEFAULT_LLM_SEED = 4242
 JSON_MODE_USER_HINT = "Return valid json only."
+DEFAULT_VERIFICATION_MAX_COMPLETION_TOKENS = 512
+
+
+def _validate_ollama_num_ctx(value: Any) -> int | None:
+    """Validate a native Ollama context-window override."""
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"ollama_num_ctx must be a positive integer, got {value!r}")
+    if value < 1:
+        raise ValueError(f"ollama_num_ctx must be >= 1, got {value}")
+    return value
+
 
 # Self-hosted OpenAI-compatible servers that advertise tool_choice="required"
 # but silently ignore it: instead of forcing a tool call they return
@@ -67,23 +80,68 @@ class ProviderResponseError(RuntimeError):
         self.retryable = retryable
 
 
+def _is_json(text: str) -> bool:
+    """True if ``text`` parses as a JSON value."""
+    try:
+        json.loads(text)
+    except (json.JSONDecodeError, ValueError):
+        return False
+    return True
+
+
+def _outer_json_span(content: str) -> str | None:
+    """Return the outermost ``{...}`` / ``[...]`` span if it parses as JSON, else None.
+
+    Fallback for responses where fences are partial/absent or the model wrapped
+    the JSON in surrounding prose. Only returned when it is valid JSON so callers
+    never receive a worse candidate than the raw content.
+    """
+    starts = [i for i in (content.find("{"), content.find("[")) if i >= 0]
+    ends = [i for i in (content.rfind("}"), content.rfind("]")) if i >= 0]
+    if not starts or not ends:
+        return None
+    start, end = min(starts), max(ends)
+    if end <= start:
+        return None
+    candidate = content[start : end + 1].strip()
+    return candidate if _is_json(candidate) else None
+
+
 def _strip_code_fences(content: str) -> str:
     """Strip markdown code fences from LLM response if present.
 
     Many LLM providers (MiniMax, some Ollama models, Claude via proxies)
     wrap JSON responses in ```json ... ``` fences even when json_object
-    response format is requested. This strips the fences while preserving
-    the JSON content inside. Returns the original content unchanged if
-    no fences are detected.
+    response format is requested. Fences are detected by line (a closing
+    ``` must sit alone on its line) so triple-backticks *inside* JSON string
+    values do not truncate the payload. When the stripped candidate is not
+    valid JSON (partial fence, prose-wrapped output, truncated response), fall
+    back to the outermost parseable JSON span. Returns the original content
+    unchanged if no better candidate is found.
     """
-    if "```" not in content:
-        return content
-    try:
-        if "```json" in content:
-            return content.split("```json")[1].split("```")[0].strip()
-        return content.split("```")[1].split("```")[0].strip()
-    except (IndexError, ValueError):
-        return content
+    candidate = content
+    if "```" in content:
+        lines = content.split("\n")
+        # Find first line that starts a code fence (``` optionally followed by language)
+        fence_start = next((i for i, line in enumerate(lines) if line.startswith("```")), None)
+        if fence_start is not None:
+            # Find matching closing fence (``` alone or with trailing whitespace)
+            fence_end = next(
+                (j for j in range(fence_start + 1, len(lines)) if lines[j].strip() == "```"),
+                None,
+            )
+            if fence_end is not None:
+                candidate = "\n".join(lines[fence_start + 1 : fence_end]).strip()
+
+    if _is_json(candidate):
+        return candidate
+
+    # Fence stripping did not yield valid JSON — try to recover the outer JSON span.
+    span = _outer_json_span(content)
+    if span is not None:
+        return span
+
+    return candidate
 
 
 # Reasoning/thinking tags emitted by extended-thinking models. Some providers
@@ -435,6 +493,8 @@ class OpenAICompatibleLLM(LLMInterface):
         timeout: float | None = None,
         groq_service_tier: str | None = None,
         extra_body: dict[str, Any] | None = None,
+        *,
+        ollama_num_ctx: int | None = None,
         **kwargs: Any,
     ):
         """
@@ -449,6 +509,8 @@ class OpenAICompatibleLLM(LLMInterface):
             timeout: Request timeout in seconds (uses env var or 120s default).
             groq_service_tier: Groq service tier ("on_demand", "flex", "auto").
             extra_body: Extra body params merged into every API call.
+            ollama_num_ctx: Native Ollama context window override. None lets Ollama use
+                the model/server default.
             **kwargs: Additional provider-specific parameters.
         """
         super().__init__(provider, api_key, base_url, model, reasoning_effort, **kwargs)
@@ -465,6 +527,7 @@ class OpenAICompatibleLLM(LLMInterface):
             "deepseek",
             "volcano",
             "openrouter",
+            "requesty",
             "zai",
             "opencode-go",
             "atlas",
@@ -489,6 +552,8 @@ class OpenAICompatibleLLM(LLMInterface):
                 self.base_url = "https://api.deepseek.com"
             elif self.provider == "openrouter":
                 self.base_url = "https://openrouter.ai/api/v1"
+            elif self.provider == "requesty":
+                self.base_url = "https://router.requesty.ai/v1"
             elif self.provider == "zai":
                 self.base_url = "https://api.z.ai/api/coding/paas/v4"
             elif self.provider == "opencode-go":
@@ -513,6 +578,7 @@ class OpenAICompatibleLLM(LLMInterface):
                 "minimax",
                 "deepseek",
                 "openrouter",
+                "requesty",
                 "zai",
                 "opencode-go",
                 "atlas",
@@ -525,6 +591,7 @@ class OpenAICompatibleLLM(LLMInterface):
         # Service tier configuration (from config, not env vars)
         self.groq_service_tier = groq_service_tier
         self.openai_service_tier = kwargs.get("openai_service_tier")
+        self.ollama_num_ctx = _validate_ollama_num_ctx(ollama_num_ctx)
         # User-configured extra body params (merged into every API call)
         self._config_extra_body = extra_body or {}
 
@@ -567,6 +634,10 @@ class OpenAICompatibleLLM(LLMInterface):
             return True
         return self.provider == "openai" and bool(self.base_url)
 
+    def _verification_max_completion_tokens(self) -> int:
+        """Return the startup verification budget for OpenAI-compatible gateways."""
+        return DEFAULT_VERIFICATION_MAX_COMPLETION_TOKENS
+
     async def verify_connection(self) -> None:
         """
         Verify that the provider is configured correctly by making a simple test call.
@@ -578,7 +649,7 @@ class OpenAICompatibleLLM(LLMInterface):
             logger.info(f"Verifying connection: {self.provider}/{self.model}")
             await self.call(
                 messages=[{"role": "user", "content": "Say 'ok'"}],
-                max_completion_tokens=100,
+                max_completion_tokens=self._verification_max_completion_tokens(),
                 max_retries=2,
                 initial_backoff=0.5,
                 max_backoff=2.0,
@@ -639,6 +710,11 @@ class OpenAICompatibleLLM(LLMInterface):
         # openai with custom base_url, ollama, lmstudio, minimax, volcano —
         # use the widely-supported max_tokens
         return "max_tokens"
+
+    def _apply_provider_extra_body_defaults(self, extra_body: dict[str, Any]) -> None:
+        """Apply provider-specific extra_body defaults while preserving user overrides."""
+        if self.provider == "minimax":
+            extra_body.setdefault("thinking", {"type": "disabled"})
 
     async def call(
         self,
@@ -727,6 +803,7 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # Provider-specific parameters
         extra_body: dict[str, Any] = {**self._config_extra_body}
+        self._apply_provider_extra_body_defaults(extra_body)
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
             # Add service_tier if configured
@@ -1145,6 +1222,7 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # Provider-specific parameters
         extra_body: dict[str, Any] = {**self._config_extra_body}
+        self._apply_provider_extra_body_defaults(extra_body)
         if self.provider == "groq":
             call_params["seed"] = DEFAULT_LLM_SEED
         if extra_body:
@@ -1333,9 +1411,10 @@ class OpenAICompatibleLLM(LLMInterface):
 
         # Add optional parameters with optimized defaults for Ollama
         options: dict[str, Any] = {
-            "num_ctx": 16384,  # 16k context window for larger prompts
             "num_batch": 512,  # Optimal batch size for prompt processing
         }
+        if self.ollama_num_ctx is not None:
+            options["num_ctx"] = self.ollama_num_ctx
         if max_completion_tokens:
             options["num_predict"] = max_completion_tokens
         if temperature is not None:

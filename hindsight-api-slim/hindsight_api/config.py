@@ -147,6 +147,20 @@ ENV_LLM_EXTRA_BODY = "HINDSIGHT_API_LLM_EXTRA_BODY"
 ENV_LLM_DEFAULT_HEADERS = "HINDSIGHT_API_LLM_DEFAULT_HEADERS"
 ENV_LLM_STRICT_SCHEMA = "HINDSIGHT_API_LLM_STRICT_SCHEMA"
 ENV_LLM_SEND_BANK_AS_USER = "HINDSIGHT_API_LLM_SEND_BANK_AS_USER"
+ENV_LLM_OLLAMA_NUM_CTX = "HINDSIGHT_API_LLM_OLLAMA_NUM_CTX"
+
+# Per-operation sampling temperature. Each internal LLM call uses a temperature
+# tuned for its task (deterministic extraction vs. creative reflection). These
+# expose those as overridable knobs. Resolution per operation:
+#   per-operation env -> global env (ENV_LLM_TEMPERATURE) -> built-in default.
+# A value of "none"/"default"/"" (or "off") omits the temperature parameter
+# entirely, for models that reject explicit temperatures (e.g. Azure GPT-5.5,
+# which only accepts the default value) -- see issue #2459.
+ENV_LLM_TEMPERATURE = "HINDSIGHT_API_LLM_TEMPERATURE"
+ENV_LLM_TEMPERATURE_VERIFICATION = "HINDSIGHT_API_LLM_TEMPERATURE_VERIFICATION"
+ENV_LLM_TEMPERATURE_RETAIN = "HINDSIGHT_API_LLM_TEMPERATURE_RETAIN"
+ENV_LLM_TEMPERATURE_REFLECT = "HINDSIGHT_API_LLM_TEMPERATURE_REFLECT"
+ENV_LLM_TEMPERATURE_CONSOLIDATION = "HINDSIGHT_API_LLM_TEMPERATURE_CONSOLIDATION"
 
 # Multi-LLM strategy. Extra LLMs are configured by index alongside the unindexed
 # primary (e.g. HINDSIGHT_API_LLM_1_PROVIDER, HINDSIGHT_API_LLM_2_PROVIDER, ...),
@@ -165,6 +179,12 @@ ENV_CONSOLIDATION_LLM_STRATEGY = "HINDSIGHT_API_CONSOLIDATION_LLM_STRATEGY"
 # llm_vertexai_*). Note the single token "LITELLMROUTER" — keeping it one word
 # disambiguates from the embeddings/reranker LITELLM_* settings.
 ENV_LLM_LITELLMROUTER_CONFIG = "HINDSIGHT_API_LLM_LITELLMROUTER_CONFIG"
+
+# Per-operation temperature defaults (preserve historical hardcoded values).
+DEFAULT_LLM_TEMPERATURE_VERIFICATION = 0.0  # connection check
+DEFAULT_LLM_TEMPERATURE_RETAIN = 0.1  # fact extraction
+DEFAULT_LLM_TEMPERATURE_REFLECT = 0.9  # reflect "thinking"
+DEFAULT_LLM_TEMPERATURE_CONSOLIDATION = 0.0  # mental-model delta / dedup
 
 # Defaults for service tiers
 DEFAULT_LLM_GROQ_SERVICE_TIER = "auto"  # "on_demand", "flex", or "auto"
@@ -187,6 +207,46 @@ def parse_gemini_service_tier(value: str | None) -> str | None:
             f"{tier!r}. Must be one of: {', '.join(t for t in valid_tiers if t is not None)}."
         )
     return tier
+
+
+# Sentinel strings that, as a temperature value, mean "omit the temperature
+# parameter entirely" rather than a numeric setting.
+_TEMPERATURE_OMIT_VALUES = frozenset({"", "none", "default", "off", "unset"})
+
+
+def _parse_temperature(raw: str) -> float | None:
+    """Parse a raw temperature env value into a float, or None to omit it.
+
+    Returns None for the omit sentinels (so the temperature parameter is dropped
+    from the LLM call); otherwise parses a float and validates the 0.0-2.0 range.
+    """
+    if raw.strip().lower() in _TEMPERATURE_OMIT_VALUES:
+        return None
+    try:
+        value = float(raw)
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid LLM temperature {raw!r}: must be a number in [0.0, 2.0] "
+            f"or one of {sorted(_TEMPERATURE_OMIT_VALUES)} to omit it."
+        ) from e
+    if not 0.0 <= value <= 2.0:
+        raise ValueError(f"Invalid LLM temperature {value}: must be in [0.0, 2.0].")
+    return value
+
+
+def _resolve_operation_temperature(operation_env: str, default: float) -> float | None:
+    """Resolve a per-operation temperature: per-op env -> global env -> default.
+
+    The omit sentinels resolve to None at any layer, so a single
+    ``HINDSIGHT_API_LLM_TEMPERATURE=none`` drops temperature from every operation
+    that has no explicit per-operation override.
+    """
+    raw = os.getenv(operation_env)
+    if raw is None:
+        raw = os.getenv(ENV_LLM_TEMPERATURE)
+    if raw is None:
+        return default
+    return _parse_temperature(raw)
 
 
 # Per-operation LLM configuration (optional, falls back to global LLM config)
@@ -281,6 +341,11 @@ ENV_EMBEDDINGS_OPENROUTER_MODEL = "HINDSIGHT_API_EMBEDDINGS_OPENROUTER_MODEL"
 ENV_RERANKER_OPENROUTER_API_KEY = "HINDSIGHT_API_RERANKER_OPENROUTER_API_KEY"
 ENV_RERANKER_OPENROUTER_MODEL = "HINDSIGHT_API_RERANKER_OPENROUTER_MODEL"
 ENV_RERANKER_OPENROUTER_BASE_URL = "HINDSIGHT_API_RERANKER_OPENROUTER_BASE_URL"
+
+# Requesty configuration (OpenAI-compatible gateway; embeddings)
+ENV_REQUESTY_API_KEY = "HINDSIGHT_API_REQUESTY_API_KEY"
+ENV_EMBEDDINGS_REQUESTY_API_KEY = "HINDSIGHT_API_EMBEDDINGS_REQUESTY_API_KEY"
+ENV_EMBEDDINGS_REQUESTY_MODEL = "HINDSIGHT_API_EMBEDDINGS_REQUESTY_MODEL"
 
 # ZeroEntropy configuration (embeddings)
 ENV_EMBEDDINGS_ZEROENTROPY_API_KEY = "HINDSIGHT_API_EMBEDDINGS_ZEROENTROPY_API_KEY"
@@ -509,7 +574,6 @@ ENV_LLAMACPP_EXTRA_ARGS = "HINDSIGHT_API_LLAMACPP_EXTRA_ARGS"
 
 # Optimization flags
 ENV_SKIP_LLM_VERIFICATION = "HINDSIGHT_API_SKIP_LLM_VERIFICATION"
-ENV_LAZY_RERANKER = "HINDSIGHT_API_LAZY_RERANKER"
 
 # Database migrations
 ENV_RUN_MIGRATIONS_ON_STARTUP = "HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP"
@@ -575,6 +639,7 @@ ENV_RECALL_BUDGET_MAX = "HINDSIGHT_API_RECALL_BUDGET_MAX"
 
 # Recall candidate gating (per-source cap + BM25 score floor)
 ENV_BM25_MIN_SCORE = "HINDSIGHT_API_BM25_MIN_SCORE"
+ENV_BM25_MAX_QUERY_TERMS = "HINDSIGHT_API_BM25_MAX_QUERY_TERMS"
 ENV_RECALL_MAX_CANDIDATES_PER_SOURCE = "HINDSIGHT_API_RECALL_MAX_CANDIDATES_PER_SOURCE"
 # Per-strategy recall boost. Prioritises specific retrieval arms (semantic,
 # bm25, graph, temporal) on recall via a human priority level — e.g.
@@ -643,6 +708,7 @@ PROVIDER_DEFAULT_MODELS = {
     "bedrock": "us.amazon.nova-2-lite-v1:0",
     "volcano": "doubao-pro-32k",
     "openrouter": "qwen/qwen3.5-9b",
+    "requesty": "openai/gpt-4o-mini",
     "fireworks": "accounts/fireworks/models/llama-v3p1-8b-instruct",
     "nous": "deepseek/deepseek-v4-flash",
 }
@@ -725,6 +791,9 @@ DEFAULT_SEMANTIC_MIN_SIMILARITY = 0.3
 # zero-score (non-matching) rows on backends — notably VectorChord — whose
 # operator ranks every document rather than pre-filtering to term matches.
 DEFAULT_BM25_MIN_SCORE = 0.0
+# Native tsvector BM25 can optionally cap the OR tsquery built from normalized
+# query tokens. 0 preserves the historical uncapped behavior.
+DEFAULT_BM25_MAX_QUERY_TERMS = 0
 # Per-source candidate cap applied to each retrieval arm (semantic, BM25, graph,
 # temporal) before RRF, so a single over-expanding backend cannot fill the
 # reranker's global candidate budget on its own. 0 disables the cap.
@@ -798,6 +867,9 @@ DEFAULT_RERANKER_COHERE_MODEL = "rerank-english-v3.0"
 DEFAULT_EMBEDDINGS_OPENROUTER_MODEL = "perplexity/pplx-embed-v1-0.6b"
 DEFAULT_RERANKER_OPENROUTER_MODEL = "cohere/rerank-v3.5"
 DEFAULT_RERANKER_OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/rerank"
+
+# Requesty defaults
+DEFAULT_EMBEDDINGS_REQUESTY_MODEL = "openai/text-embedding-3-small"
 
 # ZeroEntropy defaults
 DEFAULT_EMBEDDINGS_ZEROENTROPY_MODEL = "zembed-1"
@@ -1139,6 +1211,19 @@ def _parse_positive_int(name: str, raw: str | None, default: int) -> int:
         raise ValueError(f"{name} must be an integer, got {raw!r}") from e
     if parsed < 1:
         raise ValueError(f"{name} must be >= 1, got {parsed}")
+    return parsed
+
+
+def _parse_non_negative_int(name: str, raw: str | None, default: int) -> int:
+    """Parse an env var that must be an integer >= 0."""
+    if raw is None or raw == "":
+        return default
+    try:
+        parsed = int(raw)
+    except ValueError as e:
+        raise ValueError(f"{name} must be an integer, got {raw!r}") from e
+    if parsed < 0:
+        raise ValueError(f"{name} must be >= 0, got {parsed}")
     return parsed
 
 
@@ -1510,6 +1595,17 @@ class HindsightConfig:
     # LiteLLM, Helicone) key attribution on the OpenAI `user` field. Opt-in; never
     # overrides a `user` the caller already set.
     llm_send_bank_as_user: bool
+    # Optional native Ollama context window override. Unset lets Ollama use the
+    # model/server default instead of forcing a Hindsight-wide value.
+    llm_ollama_num_ctx: int | None = field(default=None, kw_only=True)
+
+    # Per-operation sampling temperature. None means the temperature parameter is
+    # omitted from the call (for models that reject explicit temperatures). See
+    # ENV_LLM_TEMPERATURE and _resolve_operation_temperature.
+    llm_temperature_verification: float | None
+    llm_temperature_retain: float | None
+    llm_temperature_reflect: float | None
+    llm_temperature_consolidation: float | None
 
     # LiteLLM Router chain (provider-specific; consumed by the "litellmrouter" provider).
     # List of deployment dicts evaluated in order with fallback on transient errors.
@@ -1600,6 +1696,8 @@ class HindsightConfig:
     embeddings_cohere_output_dimensions: int | None
     embeddings_openrouter_api_key: str | None
     embeddings_openrouter_model: str
+    embeddings_requesty_api_key: str | None
+    embeddings_requesty_model: str
     embeddings_litellm_api_base: str
     embeddings_litellm_api_key: str | None
     embeddings_litellm_model: str
@@ -1808,7 +1906,6 @@ class HindsightConfig:
 
     # Optimization flags
     skip_llm_verification: bool
-    lazy_reranker: bool
 
     # Database migrations
     run_migrations_on_startup: bool
@@ -1903,6 +2000,7 @@ class HindsightConfig:
     reflect_llm_strategy: LLMStrategyConfig | None = None
     consolidation_llm_members: list[LLMMemberConfig] = field(default_factory=list)
     consolidation_llm_strategy: LLMStrategyConfig | None = None
+    bm25_max_query_terms: int = DEFAULT_BM25_MAX_QUERY_TERMS
 
     # Class-level sets for configuration categorization
 
@@ -2103,6 +2201,9 @@ class HindsightConfig:
                 f"Invalid semantic_min_similarity: {self.semantic_min_similarity}. Must be between 0.0 and 1.0"
             )
 
+        if self.bm25_max_query_terms < 0:
+            raise ValueError(f"Invalid bm25_max_query_terms: {self.bm25_max_query_terms}. Must be >= 0")
+
         # Validate bedrock_service_tier
         valid_bedrock_tiers = (None, "flex", "priority", "reserved")
         if self.llm_bedrock_service_tier not in valid_bedrock_tiers:
@@ -2243,6 +2344,22 @@ class HindsightConfig:
             llm_strict_schema=os.getenv(ENV_LLM_STRICT_SCHEMA, str(DEFAULT_LLM_STRICT_SCHEMA)).lower() in ("true", "1"),
             llm_send_bank_as_user=os.getenv(ENV_LLM_SEND_BANK_AS_USER, str(DEFAULT_LLM_SEND_BANK_AS_USER)).lower()
             in ("true", "1"),
+            llm_ollama_num_ctx=_parse_optional_positive_int(
+                ENV_LLM_OLLAMA_NUM_CTX,
+                os.getenv(ENV_LLM_OLLAMA_NUM_CTX),
+            ),
+            llm_temperature_verification=_resolve_operation_temperature(
+                ENV_LLM_TEMPERATURE_VERIFICATION, DEFAULT_LLM_TEMPERATURE_VERIFICATION
+            ),
+            llm_temperature_retain=_resolve_operation_temperature(
+                ENV_LLM_TEMPERATURE_RETAIN, DEFAULT_LLM_TEMPERATURE_RETAIN
+            ),
+            llm_temperature_reflect=_resolve_operation_temperature(
+                ENV_LLM_TEMPERATURE_REFLECT, DEFAULT_LLM_TEMPERATURE_REFLECT
+            ),
+            llm_temperature_consolidation=_resolve_operation_temperature(
+                ENV_LLM_TEMPERATURE_CONSOLIDATION, DEFAULT_LLM_TEMPERATURE_CONSOLIDATION
+            ),
             llm_litellmrouter_config=_parse_llm_router_config(ENV_LLM_LITELLMROUTER_CONFIG),
             # Vertex AI
             llm_vertexai_project_id=os.getenv(ENV_LLM_VERTEXAI_PROJECT_ID) or DEFAULT_LLM_VERTEXAI_PROJECT_ID,
@@ -2415,6 +2532,11 @@ class HindsightConfig:
             or os.getenv(ENV_OPENROUTER_API_KEY)
             or os.getenv(ENV_LLM_API_KEY),
             embeddings_openrouter_model=os.getenv(ENV_EMBEDDINGS_OPENROUTER_MODEL, DEFAULT_EMBEDDINGS_OPENROUTER_MODEL),
+            # Requesty embeddings (with fallback to shared Requesty key, then LLM key)
+            embeddings_requesty_api_key=os.getenv(ENV_EMBEDDINGS_REQUESTY_API_KEY)
+            or os.getenv(ENV_REQUESTY_API_KEY)
+            or os.getenv(ENV_LLM_API_KEY),
+            embeddings_requesty_model=os.getenv(ENV_EMBEDDINGS_REQUESTY_MODEL, DEFAULT_EMBEDDINGS_REQUESTY_MODEL),
             # ZeroEntropy embeddings
             embeddings_zeroentropy_api_key=os.getenv(ENV_EMBEDDINGS_ZEROENTROPY_API_KEY)
             or os.getenv("ZEROENTROPY_API_KEY"),
@@ -2515,6 +2637,11 @@ class HindsightConfig:
             reranker_max_candidates=int(os.getenv(ENV_RERANKER_MAX_CANDIDATES, str(DEFAULT_RERANKER_MAX_CANDIDATES))),
             semantic_min_similarity=float(os.getenv(ENV_SEMANTIC_MIN_SIMILARITY, str(DEFAULT_SEMANTIC_MIN_SIMILARITY))),
             bm25_min_score=float(os.getenv(ENV_BM25_MIN_SCORE, str(DEFAULT_BM25_MIN_SCORE))),
+            bm25_max_query_terms=_parse_non_negative_int(
+                ENV_BM25_MAX_QUERY_TERMS,
+                os.getenv(ENV_BM25_MAX_QUERY_TERMS),
+                DEFAULT_BM25_MAX_QUERY_TERMS,
+            ),
             recall_max_candidates_per_source=int(
                 os.getenv(ENV_RECALL_MAX_CANDIDATES_PER_SOURCE, str(DEFAULT_RECALL_MAX_CANDIDATES_PER_SOURCE))
             ),
@@ -2635,7 +2762,6 @@ class HindsightConfig:
             ),
             # Optimization flags
             skip_llm_verification=os.getenv(ENV_SKIP_LLM_VERIFICATION, "false").lower() == "true",
-            lazy_reranker=os.getenv(ENV_LAZY_RERANKER, "false").lower() == "true",
             # Retain settings
             retain_max_completion_tokens=int(
                 os.getenv(ENV_RETAIN_MAX_COMPLETION_TOKENS, str(DEFAULT_RETAIN_MAX_COMPLETION_TOKENS))

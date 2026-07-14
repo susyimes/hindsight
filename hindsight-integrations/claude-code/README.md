@@ -223,10 +223,15 @@ Auto-recall runs on every user prompt. It queries Hindsight for relevant memorie
 | `autoRecall` | `HINDSIGHT_AUTO_RECALL` | `true` | Master switch for auto-recall. Set to `false` to disable memory retrieval entirely. |
 | `recallBudget` | `HINDSIGHT_RECALL_BUDGET` | `"mid"` | Controls how hard Hindsight searches for memories. `"low"` = fast, fewer strategies; `"mid"` = balanced; `"high"` = thorough, slower. Affects latency directly. |
 | `recallMaxTokens` | `HINDSIGHT_RECALL_MAX_TOKENS` | `1024` | Maximum number of tokens in the recalled memory block. Lower values reduce context usage but may truncate relevant memories. |
+| `recallMinScores` | — | `{}` | Optional score floors applied after recall from the main and additional banks, keyed by score field (for example `{"semantic": 0.65, "reranker": 0.2}`). Missing or `null` scores pass so BM25-only and passthrough-reranker hits are not accidentally suppressed. When a cross-encoder reranker is active, the `reranker` floor is the main precision gate; treat reranker scores as query-local and not calibrated across queries. |
 | `recallTypes` | — | `["observation"]` | Which memory types to retrieve. `"world"` = general facts; `"experience"` = personal experiences; `"observation"` = consolidated, deduplicated beliefs built from multiple facts. Defaults to observations so the same answer doesn't surface multiple times when many raw memories say the same thing. |
 | `recallContextTurns` | `HINDSIGHT_RECALL_CONTEXT_TURNS` | `1` | How many prior conversation turns to include when composing the recall query. `1` = only the latest user message; higher values give more context but may dilute the query. |
 | `recallMaxQueryChars` | `HINDSIGHT_RECALL_MAX_QUERY_CHARS` | `800` | Maximum character length of the query sent to Hindsight. Longer queries are truncated. |
 | `recallRoles` | — | `["user", "assistant"]` | Which message roles to include when building the recall query from prior turns. |
+| `recallTags` | `HINDSIGHT_RECALL_TAGS` | `[]` | Optional tags to pass to the recall API, such as `["memory_type:rule"]`. The env var accepts JSON or a comma-separated list. |
+| `recallTagsMatch` | `HINDSIGHT_RECALL_TAGS_MATCH` | `"any"` | Tag matching mode used with `recallTags` or `recallTagGroups`: `"any"`, `"all"`, `"any_strict"`, or `"all_strict"`. |
+| `recallTagGroups` | `HINDSIGHT_RECALL_TAG_GROUPS` | `null` | Optional compound tag filter passed through to the recall API. The env var must be JSON. |
+| `recallAdditionalBankFilters` | `HINDSIGHT_RECALL_ADDITIONAL_BANK_FILTERS` | `{}` | Optional per-bank tag filter overrides for banks listed in `recallAdditionalBanks`, keyed by bank ID. Each value may set `recallTags`, `recallTagsMatch`, and `recallTagGroups`. The env var must be JSON. |
 | `recallPromptPreamble` | — | built-in string | Text placed above the recalled memories in the injected context block. Customize this to change how Claude interprets the memories. |
 
 ---
