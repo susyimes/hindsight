@@ -15,6 +15,11 @@ import pytest
 from hindsight_api.engine.memory_engine import MemoryEngine
 
 
+# The routines scan every tenant schema while the multi-tenant test creates and
+# drops 100 schemas. Keep both modules on one worker to avoid DDL lock inversion.
+pytestmark = pytest.mark.xdist_group("maintenance_schema_ddl")
+
+
 def _load_repair_migration():
     """Import the repair migration by path (filename starts with a digit, so it
     is not importable as a normal module name)."""

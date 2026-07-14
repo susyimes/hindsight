@@ -247,6 +247,31 @@ class TestMockLLMProvider:
         assert usage.output_tokens == 5
         assert usage.total_tokens == 15
 
+    @pytest.mark.asyncio
+    async def test_mock_provider_populates_required_structured_fields(self):
+        """Structured mock calls return data accepted by the requested model."""
+        from pydantic import BaseModel
+
+        from hindsight_api.engine.llm_wrapper import LLMProvider
+
+        class RecommendationResponse(BaseModel):
+            recommendation: str
+            reasons: list[str]
+            confidence: str | None = None
+
+        provider = LLMProvider(provider="mock", api_key="", base_url="", model="test-model")
+        result = await provider.call(
+            messages=[{"role": "user", "content": "test"}],
+            response_format=RecommendationResponse,
+            scope="reflect_structured",
+            skip_validation=True,
+        )
+
+        payload = result.model_dump() if hasattr(result, "model_dump") else result
+        parsed = RecommendationResponse.model_validate(payload)
+        assert parsed.recommendation
+        assert parsed.reasons
+
 
 class TestRetainUsesRetainLLMConfig:
     """Test that retain operations use the retain LLM config."""

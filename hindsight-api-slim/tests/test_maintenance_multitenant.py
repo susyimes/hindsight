@@ -19,6 +19,8 @@ from hindsight_api.engine.memory_engine import MemoryEngine, _current_schema
 from hindsight_api.extensions.builtin.tenant import DefaultTenantExtension
 from hindsight_api.extensions.tenant import Tenant
 
+pytestmark = pytest.mark.xdist_group("maintenance_schema_ddl")
+
 N_TENANTS = 100
 _CLONED_TABLES = ("banks", "memory_units", "async_operations", "audit_log", "llm_requests")
 
@@ -43,10 +45,8 @@ async def hundred_tenant_schemas(memory: MemoryEngine):
     # visible to other connections only once fully built. Without this, each DDL
     # autocommits, leaving a window where a schema exists with only some of its
     # tables. The global maintenance routines (schemas_with_expired_rows /
-    # banks_needing_consolidation) discover schemas by table presence and are run
-    # concurrently by test_maintenance_routines on another xdist worker against
-    # the shared test DB; they would query a not-yet-created table in a half-built
-    # schema and fail with `relation "<schema>.<table>" does not exist`.
+    # banks_needing_consolidation) discover schemas by table presence; publishing
+    # the complete set atomically prevents scans from seeing half-built schemas.
     async with memory._pool.acquire() as conn:
         async with conn.transaction():
             for s in schemas:
